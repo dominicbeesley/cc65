@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+
+
+
+@ARGV == 3 || die "USAGE: makevecs <functions.lst> <vectors.s> <stubs.s>\n";
+
+$infile = @ARGV[0];
+$vectorfile = @ARGV[1];
+$stubsfile = @ARGV[2];
+
+print "Making vector definitions $outfile from $infile\n";
+
+open I, '<', $infile or die "Cannot open $infile for input\n";
+
+$ct = 0;
+$hi = 0;
+
+while (<I>) {
+	chomp;
+	$line = $_;
+	
+	if ($line =~ m/^#/) {
+	#	print "$line\n";
+	} elsif ($line =~ m/^\s*(\w+)\s*=\s*(\d+)$/) {
+	#	print "$1=$2\n";
+		if ($fn[$2]) {
+			die "There are two symbols with vector index $2";
+		}
+		$fn[$2] = $1;	
+
+		$ct ++;
+		if ($2 > $hi) {
+			$hi = $2;
+		}
+
+	} elsif ($line =~ m/^\s*$/) {
+	#	print "---\n";
+	} 
+
+}
+
+close I;
+
+
+
+open VO, '>', "$vectorfile" or die "Cannot open $vectorfile for output\n";
+
+print "$ct functions, highest vector number $hi\n";
+	
+print VO "\t\t.segment \"VECTORS\"\n";
+
+print VO "\t\t.import initclib\n\stubs_initclib:\tjmp initclib\n";
+
+for $x (1..$hi) {
+	
+	if ($fn[$x]) {
+		print VO "\t\t.import $fn[$x]\n";
+		print VO "\t\t.export stub_$fn[$x]\n";
+	}
+}
+
+for $x (1..$hi) {
+	if ($fn[$x]) {
+		print VO "stub_$fn[$x]:\tjmp\t$fn[$x]\n";
+	} else {
+		print VO "\t\tjmp\t\$0\t;blank\n" ;
+	}
+}
+
+close VO;
+
+open SO, '>', "$stubsfile" or die "Cannot open $stubsfile for output\n";
+
+$addr = 0xB803;
+
+print SO "\t\t.export initclib\n\t\tinitclib=\$B800\n";
+
+for $x (1..$hi) {
+	$hexaddr = sprintf("%x", $addr);
+	if ($fn[$x]) {
+		print SO "\t\t.export $fn[$x]\n\t\t$fn[$x] = \$$hexaddr ; $addr\n";
+	}
+	$addr += 3;
+}

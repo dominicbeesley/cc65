@@ -1,0 +1,55 @@
+#!/usr/bin/perl
+
+open MAP, '<', "clib.map" or die "cannot open clib.map";
+
+HEADER: while (<MAP>) {
+	chomp;
+	if (m/Imports\slist\:/) {
+		last HEADER;
+	} else {
+
+	}
+}
+
+$symbol = "";
+
+while (<MAP>) {
+	chomp;
+	$l = $_;
+	if ($l =~ m/^\-/ || $l =~ /^\s*$/) {
+		# skip
+	} elsif ($l =~ m/^\s+\w+/) {
+		$uses{$symbol} = $uses{$symbol} . $l . "\n";
+	} elsif ($l =~ m/^(\w+)\s+\(([^\)]*)/) {
+		$symbol = $1;
+		$defs{$symbol} = $2;
+	} else {
+		die "Unrecognized line in clib.map : \"$l\"";
+	}
+}
+
+close MAP;
+
+open FN, '<', "functions.lst" or die "cannot open functions.lst\n";
+
+while (<FN>) {
+	chomp;
+	$l = $_;
+	
+	if (m/^\s*(\w+)\s*\=\s*(\d+)/) {
+		$stubs{$1} = $2;
+	}
+}
+
+for $symbol (sort keys %defs) {
+	if (! ($stubs{$symbol}) 
+	&& !($defs{$symbol}=~m/^\[/)
+	&& !($defs{$symbol}=~m/zeropage\.o/)
+	&& !($defs{$symbol}=~m/clib\.o/)
+	&& !($defs{$symbol}=~m/main\.o/)
+	) {
+		print "$symbol defined in $defs{$symbol} not listed in stubs, used in:\n";
+		print $uses{$symbol};
+	}
+}
+	

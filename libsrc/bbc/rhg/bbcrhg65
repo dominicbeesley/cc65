@@ -1,0 +1,665 @@
+#!/usr/bin/perl
+#
+#
+#
+#
+my $prog_name = "bbcrhg65";
+my $prog_version = "0.1";
+
+use strict 'vars';
+use warnings;
+
+use Getopt::Long;
+
+my $verbose = 0;
+my $version = 0;
+my $usage = 0;
+
+my $file_in = '';
+my $file_noext = '';
+my $file_inc = '';
+my $file_h = '';
+my $file_s = '';
+my $rom_flags = 0x82; # Service entry + bit 1 (always)
+
+#########################################
+#    D O   S E R V I C E   E N T R Y    #
+#########################################
+
+sub doservice {
+	my ($num, $sym) = @_;
+	
+	if ($sym) {
+
+		print S "\t\tcmp #$num\n";
+		print S "\t\tbne __NOT_SERV_$num\n";
+		print S "\t\tjmp $sym\n";
+		print S "__NOT_SERV_$num:\n";
+	}
+}
+
+#########################################
+#              A S M E S C              #
+#########################################
+
+sub asmesc {
+	my ($str) = @_;
+	
+	my $ret = "";
+	my $started = 0;
+	my $op = 0; #are quotes open?
+	
+	if ($str eq "") {
+		return;
+	}
+		
+	while ($str ne "") {
+		my $c = substr($str,0,1,"");
+		if (ord($c)<32) {
+			if ($op) {
+				$ret = $ret . "\"";
+				$op = 0;
+			}
+			if ($started) {
+				$ret = $ret . ","
+			}
+			$ret = $ret . ord($c);
+		} else {
+			if (!$op) {
+				if ($started) {
+					$ret = $ret . ",";
+				}
+				$ret = $ret . "\"";
+				$op = 1;
+			}
+			$ret = $ret . $c;
+		}
+		
+		$started = 1;
+	}
+	
+	if ($op) {
+		$ret = $ret . "\"";
+	}
+	
+	$_ = $ret;
+}
+
+#########################################
+#               U S A G E               #
+#########################################
+
+sub usage {
+	print STDERR "Usage: $prog_name [options] [--] filename\n";
+}
+
+#########################################
+#              V E R S I O N            #
+#########################################
+
+sub version {
+	printf "%s %s\n", $prog_name, $prog_version
+}
+
+
+#########################################
+#                 M A I N               #
+#########################################
+
+GetOptions ( 	"verbose|v!", => \$verbose 
+,		"version|V!", => \$version
+,		"usage|?!", => \$usage
+);
+
+if ($version) {
+	version();
+}
+
+if ($usage) {
+	usage();
+}
+
+
+if ($#ARGV != 0) {
+	print STDERR "Too many or few files\n";
+	usage();
+	exit;
+}
+
+$file_in = $ARGV[0];
+($file_noext = $file_in) =~ s/(\.[^\/\.]*)?$//;
+$file_h = $file_noext . ".h";
+$file_inc = $file_noext . ".inc";
+$file_s = $file_noext . ".s";
+
+print "Reading from $file_in, writing to $file_h, $file_inc, $file_s\n";
+
+open (RHG, "< $file_in") || die "Cannot open $file_in for input\n";
+open (H, "> $file_h") || die "Cannot open $file_h for output\n";
+open (S, "> $file_s") || die "Cannot open $file_s for output\n";
+open (INC, "> $file_inc") || die "Cannot open $file_inc for output\n";
+
+my %items;
+
+while (<RHG>) {
+	chomp();
+	if (m/^\#/ || m/^\s*$/) {
+		#comment do nothing
+	} elsif (m/\s*(\w*)\s*=\s*(.*)\s*/) {
+		$items{$1} = $2;
+	} else {
+		die "Unrecognised line $_\n";
+	}
+}	
+
+#
+# Check validity here!
+#
+
+if ($items{"TUBE_RELOC_ADDR"}) {
+	$rom_flags |= 0x20;
+}
+
+#
+#  .h top
+#
+
+print H "#ifndef ${file_noext}_H\n#define ${file_noext}_H\n\n";
+print H "extern void *rom_start;\n";
+print H "extern const char const *rom_title;\n";
+if ($items{"VERSION"}) {
+	print H "extern const char const *rom_version\n";
+}
+print H "extern const char const *rom_copyright;\n";
+print H "extern const unsigned char const *rom_bin_ver\n";
+print H "extern const void rom_service_enter(void)\n";
+
+#
+#  .s top
+#
+
+print S "\t\t.import\tOSWRCH\n";
+print S "\t\t.import\tOSNEWL\n";
+print S "\t\t.import\tOSASCI\n";
+print S "\t\t.import\tOSBYTE\n";
+
+print S "\t\t.export\t_rom_service_enter\n";
+print S "\t\t.export\t_rom_start\n";
+print S "\t\t.export\t_rom_title\n";
+print S "\t\t.export\t_rom_bin_ver\n";
+if ($items{"VERSION"}) {
+	print S "\t\t.export\t_rom_version\n";
+}
+
+print S "\n";
+print S "\t\t.segment \"ROMHEADER\"\n";
+print S "_rom_start:\n";
+
+#
+# language entry
+#
+
+
+if (! $items{"LANGUAGE_SYM"} ) {
+	print S "\t\tNOP\n\t\tNOP\n\t\tNOP\n";
+	print H "#define ROM_LANGUAGE_ENTRY\n";
+	print INC "ROM_LANGUAGE_ENTRY = \n";
+} else {
+	print S "\t\t.import\t${items{'LANGUAGE_SYM'}}\n";
+	print S "\t\tJMP\t${items{'LANGUAGE_SYM'}}\n";
+	print H "#define ROM_LANGUAGE_ENTRY ${items{'LANGUAGE_SYM'}}\n";
+	print INC "ROM_LANGUAGE_ENTRY = _${items{'LANGUAGE_SYM'}}\n";
+	$rom_flags |= 0x40;
+}
+
+#
+# service entry
+#
+
+print S "\t\tJMP\t_rom_service_enter\n";
+	
+#
+# ROM type
+#
+printf S "\t\t.byte\t\$%x\n", $rom_flags;
+
+#	
+# copyright offset
+#
+print S "\t\t.byte\t(_rom_copyright - _rom_start - 1)\n";
+
+#
+# Binary version
+#
+printf S "_rom_bin_ver:\t.byte\t\$%x\n", $items{"BIN_VER"};
+
+#
+# Title
+#
+print S "_rom_title:\t.byte\t\"${items{'TITLE'}}\", 0\n";
+
+#
+# Version
+#
+if ($items{"VERSION"}) {
+	print S "_rom_version:\t.byte\t\"${items{'VERSION'}}\", 0\n";
+}
+
+#
+# Copyright
+#
+print S "_rom_copyright:\t.byte\t\"(C)\", \"${items{'COPYRIGHT'}}\", 0\n";
+
+#
+# 2nd proc reloc addr
+#
+
+
+if ($items{"TUBE_RELOC_ADDR"}) {
+	my $tra = $items{"TUBE_RELOC_ADDR"};
+	$tra = oct($tra) if $tra =~ /^0/;
+	printf S "\t\t.word\t\$%x\t\t;tube reloc addr\n", $tra;
+}
+
+#
+# Service routine
+#
+print S "\n\n\t\t.proc _rom_service_enter\n";
+doservice 0x00,	$items{"SERVICE_NOP"};
+doservice 0x01,	$items{"SERVICE_CLAIM_SHARED_WKSP"};
+doservice 0x02,	$items{"SERVICE_CLAIM_PRIVATE_WKSP"};
+doservice 0x03,	$items{"SERVICE_AUTO_BOOT"};
+doservice 0x04,	"__docommands";
+doservice 0x05,	$items{"SERVICE_UK_IRQ"};
+doservice 0x06,	$items{"SERVICE_BRK"};
+doservice 0x07,	$items{"SERVICE_UK_OSBYTE"};
+doservice 0x08,	$items{"SERVICE_UK_OSWORD"};
+doservice 0x09,	"__dohelp";
+doservice 0x0A,	$items{"SERVICE_RELEASE_SHARED_WKSP"};
+doservice 0x0B,	$items{"SERVICE_RELEASE_NMI"};
+doservice 0x0C,	$items{"CLAIM_NMI"};
+doservice 0x0D,	"__romfsinit";
+doservice 0x0E,	"__romfsbget";
+doservice 0x0F,	$items{"SERVICE_FS_VECTORS_CLAIMED"};
+doservice 0x10,	$items{"SERVICE_SPOOL_CLOSE"};
+doservice 0x11,	$items{"SERVICE_FONT_EXPLODE"};
+doservice 0x12,	$items{"SERVICE_FS_INIT"};
+doservice 0xFE, $items{"SERVICE_TUBE_POST_INIT"};
+doservice 0xFF, $items{"SERVICE_TUBE_MAIN_INIT"};
+print S "\t\trts\n\n";
+print S "\t\t.endproc ; _rom_service_enter\n\n\n";
+
+#
+# Utils
+#
+print S <<XXX
+		.import print0
+		.import printstr
+
+		.proc tohigher
+		and 	#\$7F
+            	cmp 	#\$7B	
+            	bcs 	tlout
+            	cmp 	#\$61
+            	bcc 	tlout
+            	sbc 	#\$20
+tlout:		rts
+		.endproc 
+		
+		; cmp key calls <=ascii 32 terminated strings
+		; at (\$F2), Y and (\$80), 0
+		; returns A=0 and Z set for match
+		; string at \$F2 must be less than 255-Y long
+		
+		.proc cmpkey
+		lda	\$82
+		pha
+		tya
+		pha
+		txa
+		pha
+		
+		ldx	#0
+		
+cmplp:		lda	(\$F2), Y
+		jsr	tohigher
+		cmp	#33
+		bcc	done
+		
+		sta	\$82
+		
+		tya
+		pha
+		txa
+		tay
+		lda	(\$80), Y
+		jsr	tohigher
+		cmp	\$82
+		bne	ne
+		tya
+		tax
+		pla
+		tay
+		
+		inx
+		iny
+		bne	cmplp
+ne:		pla
+	
+		pla
+		tax
+		pla
+		tay
+		pla
+		sta	\$82
+		lda	#1
+		rts
+		
+done:		txa
+		tay
+		lda	(\$80), Y
+		cmp	#33
+		bcs	ne
+						
+		pla
+		tax
+		pla
+		tay
+		pla
+		sta	\$82
+		lda	#0
+		rts
+		
+		.endproc
+
+XXX
+;
+
+#
+# Commands
+#
+
+my %commands;
+my %helpkeys;
+
+for my $cmd (keys %items) {
+	if ($cmd =~ m/^COMMAND_(\w*)/) {
+		$cmd=$1;
+		my $cmdopts = $items{"COMMAND_$cmd"};
+		if ( $cmdopts =~ m/^(\w+)\s*(\w*)\s*(.*)/) {
+			my ($cmdsym, $cmdkey, $cmdhlp) = ($1, $2, $3);
+			$commands{$cmd} = $cmdsym;
+			if ($cmdkey && $cmdhlp) {
+				if ($helpkeys{$cmdkey}) {
+					$helpkeys{$cmdkey} = $helpkeys{$cmdkey} 
+					. "\r\n\t" . $cmdhlp;
+				} else {
+					$helpkeys{$cmdkey} = 
+					"\r\n\t" . $cmdhlp;
+				}
+			}
+			
+		} else {
+			die "Bad command options for $cmd\n";
+		}
+	}
+		
+}
+
+print S "__commandtable:\n";
+
+for my $cmd (keys %commands) {
+	print S "\t\t.import\t${commands{$cmd}}\n";	
+	print S "\t\t.word\tCMD_$cmd\n";
+	print S "\t\t.word\t${commands{$cmd}}\n";
+	
+}
+
+if ($items{"LANGUAGE_COMMAND"}) {
+	print S "\t\t.word\tCMDLANGUAGE\n";
+	print S "\t\t.word\tenterlang\n";
+}
+print S "\t\t.word	0\n";
+
+for my $cmd (keys %commands) {
+	print S "CMD_$cmd:\t.byte \"$cmd\",0\n";
+}
+
+if ($items{"LANGUAGE_COMMAND"}) {
+	print S "CMDLANGUAGE:\t.byte \"${items{'LANGUAGE_COMMAND'}}\",0\n";
+	
+	print S <<XXX
+		.proc enterlang
+		lda	#\$8E		
+		ldx	\$F4
+		jsr	OSBYTE
+		rts		; don't need this unless it doesn't work!?!
+		.endproc
+XXX
+;
+}
+
+print S "__helptable:\n";
+
+for my $key (keys %helpkeys) {
+	print S "\t\t.word\tKEY_$key\n";
+	print S "\t\t.word\tHELP_$key\n";
+}
+
+print S "\t\t.word 0\n";
+print S "\t\t.word 0\n";
+
+
+for my $key (keys %helpkeys) {
+	print S "KEY_$key:\t.byte ";
+	print S asmesc $key;
+	print S ",0\n";
+	
+	print S "HELP_$key:\t.byte ";
+	print S asmesc ${helpkeys{$key}};
+	print S ",0\n";
+}
+
+print S <<XXX
+		.proc __docommands
+		
+		pha
+		txa
+		pha
+		tya
+		pha
+	
+		ldx	#0
+cmdlp:		lda	__commandtable, X
+		sta	\$80
+		inx
+		lda	__commandtable, X
+		sta	\$81
+		inx
+		
+		lda	#0
+		cmp	\$80
+		bne	cont
+		cmp	\$81
+		beq	out	
+		
+cont:		jsr	cmpkey
+		beq	doit
+		inx
+		inx
+		jmp	cmdlp
+		
+doit:		lda	__commandtable, X
+		sta	\$80
+		inx
+		lda	__commandtable, X
+		sta	\$81
+		jsr	jmppoint
+out_nomore:	pla
+		tay
+		pla
+		tax
+		pla
+		lda	#0
+		rts
+	
+jmppoint:	jmp	(\$80)
+		
+out:		pla
+		tay
+		pla
+		tax
+		pla
+		rts
+		
+		
+		.endproc
+XXX
+;
+
+print S "\t\trts\n\n";
+
+#
+# Help
+#
+
+
+print S <<XXX
+		.proc	__dohelp
+		pha
+		txa
+		pha
+		tya
+		pha
+
+				
+		lda	(\$F2), Y
+		cmp	#32
+		bcs	helpkey
+
+		jsr	titlever
+		jsr	OSNEWL
+		
+		;print available keywords
+		ldx	#0
+showkeylp:	lda	__helptable, X
+		sta	\$F2
+		inx
+		lda	__helptable, X
+		sta	\$F3
+		inx
+		inx
+		inx
+		lda	#0
+		cmp	\$F2
+		bne	showcont
+		cmp	\$F3
+		beq	showdone
+showcont:	lda	#32
+		jsr	OSWRCH
+		jsr	OSWRCH
+		jsr	printstr
+		lda	#13
+		jsr	OSASCI
+		jmp	showkeylp
+		
+showdone:	jsr	OSNEWL
+		jmp	outhelp		
+		
+helpkey:	ldx 	#0
+helpkeylp:	lda	__helptable, X
+		sta	\$80
+		inx
+		lda	__helptable, X
+		sta	\$81
+		inx
+		lda	#0
+		cmp	\$80
+		bne	cont
+		cmp	\$81
+		beq	outhelp
+		
+cont:		jsr	cmpkey
+		beq	helpkeyfnd
+		inx
+		inx
+		jmp	helpkeylp
+		
+		
+helpkeyfnd:	txa
+		pha
+		jsr	titlever
+		pla
+		tax
+		clc
+		adc	#65
+		jsr	OSWRCH
+		lda	__helptable, X
+		sta	\$F2
+		inx
+		lda	__helptable, X
+		sta	\$F3
+		jsr	print0
+		jsr	OSNEWL
+		jsr	OSNEWL
+		jmp	outhelp
+		
+		
+titlever:	jsr	OSNEWL
+		lda	#<_rom_title
+		sta	\$F2
+		lda	#>_rom_title
+		sta	\$F3
+		jsr	printstr
+		
+		lda	#\$20
+		jsr	OSWRCH
+XXX
+;
+
+if ($items{"VERSION"}) {
+	print S <<XXX
+		lda	#<_rom_version
+		sta	\$F2
+		lda	#>_rom_version
+		sta	\$F3
+		jsr	printstr
+XXX
+;
+	}
+
+print S <<XXX		
+		rts
+		
+outhelp:	pla
+		tay
+		pla
+		tax
+		pla
+		rts
+		.endproc
+XXX
+;
+
+print S "\t\trts\n\n";
+
+#
+# ROMFS Init
+#
+
+print S "__romfsinit:\trts\n\n";
+
+#
+# ROMFS BGET
+#
+
+print S "__romfsbget:\trts\n\n";
+
+
+
+;
+
+#
+#   .h end   
+#
+print H "#endif\n\n";

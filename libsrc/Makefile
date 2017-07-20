@@ -32,7 +32,8 @@ TARGETS = apple2       \
           sim6502      \
           sim65c02     \
           supervision  \
-          telestrat
+          telestrat    \
+          bbc
 
 DRVTYPES = emd \
            joy \
@@ -170,6 +171,10 @@ endif
 ifeq ($(TARGET),$(filter $(TARGET),$(GEOS)))
   SRCDIRS += $(addprefix $(TARGET)/,  $(GEOSDIRS))
   SRCDIRS += $(addprefix geos-common/,$(GEOSDIRS))
+endif
+
+ifeq ($(TARGET), bbc)
+  SRCDIRS += bbc\oslib
 endif
 
 SRCDIRS += common   \

@@ -1,0 +1,87 @@
+#
+# cc65 makefile for the bbc specific modules
+#
+
+.SUFFIXES: .o .s .c
+
+#--------------------------------------------------------------------------
+# Rules
+
+%.o:   	%.c
+	@$(CC) $(CFLAGS) $<
+	@$(AS) -o $@ $(AFLAGS) $(*).s
+
+%.o:	%.s
+	@$(AS) -g -o $@ $(AFLAGS) $<
+
+#--------------------------------------------------------------------------
+# Object files
+
+C_OBJS =	open.o	\
+		lseek.o		\
+		systime.o	\
+		opendir.o	\
+		readdir.o	\
+		closedir.o
+
+S_OBJS  =       crt0.o          \
+                ctype.o		\
+		write.o         \
+		rwcommon.o	\
+		close.o		\
+		clock.o		\
+		clrscr.o	\
+		cputc.o		\
+		gotox.o		\
+		gotoxy.o	\
+		gotoy.o		\
+		wherex.o	\
+		wherey.o	\
+		read.o		\
+		cgetc.o		\
+		mainargs.o	\
+		sysuname.o	\
+		_scrsize.o	\
+		cclear.o	\
+		chline.o	\
+		color.o		\
+		revers.o	\
+		cvline.o	\
+		lseek_extra.o	\
+		fdtable.o	\
+		fd_getfree.o	\
+		preservezp.o	\
+		errors.o	\
+		brkret.o	\
+		printhex.o	\
+		printstr.o	\
+		print0.o	\
+		readdir.o	\
+		kbhit.o		\
+		disable_cursor_edit.o	\
+		init_stack.o	\
+		brkvec.o
+
+#--------------------------------------------------------------------------
+# Targets
+
+.PHONY:	all clean zap
+
+all:   	$(C_OBJS) $(S_OBJS)
+
+.PHONY: clean
+clean:
+	@for i in clib oslib rom $(ALLTARGETS); do\
+       	   $(MAKE) -C $$i clean;			      		   	\
+	done
+
+.PHONY: zap
+zap:	clean
+	@for i in clib oslib rom $(ALLTARGETS); do\
+	   $(MAKE) -C $$i zap;     	    	       	      	   		\
+	done
+	@$(RM) $(C_OBJS:.c=.s) $(C_OBJS) $(S_OBJS)
+	@$(RM) *.o *.emd *.joy *.lib *.tgi *.ser *.mou *~ *.orig *.rej
+	
+	
+

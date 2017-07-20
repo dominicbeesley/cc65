@@ -13,7 +13,6 @@ SEGMENTS {
     ZEROPAGE: load = ZP,       type = zp;
     STARTUP:  load = MAIN,     type = ro;
     LOWCODE:  load = MAIN,     type = ro,  optional = yes;
-    ONCE:     load = MAIN,     type = ro,  optional = yes;
     CODE:     load = MAIN,     type = ro;
     RODATA:   load = MAIN,     type = ro;
     DATA:     load = MAIN,     type = rw, define = yes;
