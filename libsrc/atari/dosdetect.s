@@ -20,6 +20,8 @@ detect: lda     DOS
         beq     mydos
         cmp     #'X'            ; XDOS
         beq     xdos
+        cmp     #'R'            ; RealDOS
+        beq     rdos
 
         lda     #$4C            ; probably default
         ldy     #COMTAB
@@ -33,16 +35,30 @@ detect: lda     DOS
         cmp     (DOSVEC),y
         beq     done
         lda     #OSADOS
+        bne     set
+
+spdos:  lda     DOS+3           ; 'B' in BW-DOS
+        cmp     #'B'
+        bne     spdos_real
+        lda     DOS+4           ; 'W' in BW-DOS
+        cmp     #'W'
+        bne     spdos_real
+
+        lda     #BWDOS
         .byte   $2C             ; BIT <abs>
 
-spdos:  lda     #SPARTADOS
+spdos_real:
+        lda     #SPARTADOS
         .byte   $2C             ; BIT <abs>
 
 mydos:  lda     #MYDOS
         .byte   $2C             ; BIT <abs>
 
+rdos:   lda     #REALDOS
+        .byte   $2C             ; BIT <abs>
+
 xdos:   lda     #XDOS
-        sta     __dos_type
+set:    sta     __dos_type
 done:   rts
 
 ; ------------------------------------------------------------------------

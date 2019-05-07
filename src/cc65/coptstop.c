@@ -6,7 +6,7 @@
 /*                                                                           */
 /*                                                                           */
 /*                                                                           */
-/* (C) 2001-2013, Ullrich von Bassewitz                                      */
+/* (C) 2001-2019, Ullrich von Bassewitz                                      */
 /*                Roemerstrasse 52                                           */
 /*                D-70794 Filderstadt                                        */
 /* EMail:         uz@cc65.org                                                */
@@ -122,7 +122,7 @@ struct StackOpData {
     const OptFuncDesc*  OptFunc;
 
     /* ZP register usage inside the sequence */
-    unsigned            UsedRegs;
+    unsigned            ZPUsage;
 
     /* Register load information for lhs and rhs */
     LoadInfo            Lhs;
@@ -437,51 +437,78 @@ static void AdjustStackOffset (StackOpData* D, unsigned Offs)
 
         CodeEntry* E = CS_GetEntry (D->Code, I);
 
-        int NeedCorrection = 0;
+        /* Check if this entry does a stack access, and if so, if it's a plain
+        ** load from stack, since this is needed later.
+        */
+        int Correction = 0;
         if ((E->Use & REG_SP) != 0) {
 
             /* Check for some things that should not happen */
             CHECK (E->AM == AM65_ZP_INDY || E->RI->In.RegY >= (short) Offs);
             CHECK (strcmp (E->Arg, "sp") == 0);
-
             /* We need to correct this one */
-            NeedCorrection = 1;
+            Correction = (E->OPC == OP65_LDA)? 2 : 1;
 
         } else if (CE_IsCallTo (E, "ldaxysp")) {
-
             /* We need to correct this one */
-            NeedCorrection = 1;
-
+            Correction = 1;
         }
 
-        if (NeedCorrection) {
-
+        if (Correction) {
             /* Get the code entry before this one. If it's a LDY, adjust the
             ** value.
             */
             CodeEntry* P = CS_GetPrevEntry (D->Code, I);
             if (P && P->OPC == OP65_LDY && CE_IsConstImm (P)) {
-
                 /* The Y load is just before the stack access, adjust it */
                 CE_SetNumArg (P, P->Num - Offs);
-
             } else {
-
                 /* Insert a new load instruction before the stack access */
                 const char* Arg = MakeHexArg (E->RI->In.RegY - Offs);
                 CodeEntry* X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, E->LI);
                 InsertEntry (D, X, I++);
-
             }
 
             /* If we need the value of Y later, be sure to reload it */
             if (RegYUsed (D->Code, I+1)) {
+                CodeEntry* N;
                 const char* Arg = MakeHexArg (E->RI->In.RegY);
-                CodeEntry* X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, E->LI);
-                InsertEntry (D, X, I+1);
+                if (Correction == 2 && (N = CS_GetNextEntry(D->Code, I)) != 0 &&
+                    ((N->Info & OF_ZBRA) != 0) && N->JumpTo != 0) {
+                    /* The Y register is used but the load instruction loads A
+                    ** and is followed by a branch that evaluates the zero flag.
+                    ** This means that we cannot just insert the load insn
+                    ** for the Y register at this place, because it would
+                    ** destroy the Z flag. Instead place load insns at the
+                    ** target of the branch and after it.
+                    ** Note: There is a chance that this code won't work. The
+                    ** jump may be a backwards jump (in which case the stack
+                    ** offset has already been adjusted) or there may be other
+                    ** instructions between the load and the conditional jump.
+                    ** Currently the compiler does not generate such code, but
+                    ** it is possible to force the optimizer into something
+                    ** invalid by use of inline assembler.
+                    */
 
-                /* Skip this instruction in the next round */
-                ++I;
+                    /* Add load insn after the branch */
+                    CodeEntry* X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, E->LI);
+                    InsertEntry (D, X, I+2);
+
+                    /* Add load insn before branch target */
+                    CodeEntry* Y = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, E->LI);
+                    int J = CS_GetEntryIndex (D->Code, N->JumpTo->Owner);
+                    CHECK (J > I);      /* Must not happen */
+                    InsertEntry (D, Y, J);
+
+                    /* Move the label to the new insn */
+                    CodeLabel* L = CS_GenLabel (D->Code, Y);
+                    CS_MoveLabelRef (D->Code, N, L);
+                } else {
+                    CodeEntry* X = NewCodeEntry (OP65_LDY, AM65_IMM, Arg, 0, E->LI);
+                    InsertEntry (D, X, I+1);
+                    /* Skip this instruction in the next round */
+                    ++I;
+                }
             }
         }
 
@@ -1771,7 +1798,7 @@ static void ResetStackOpData (StackOpData* Data)
 /* Reset the given data structure */
 {
     Data->OptFunc       = 0;
-    Data->UsedRegs      = REG_NONE;
+    Data->ZPUsage       = REG_NONE;
 
     ClearLoadInfo (&Data->Lhs);
     ClearLoadInfo (&Data->Rhs);
@@ -1832,14 +1859,16 @@ static int PreCondOk (StackOpData* D)
         return 0;
     }
 
-    /* Determine the zero page locations to use */
-    if ((D->UsedRegs & REG_PTR1) == REG_NONE) {
+    /* Determine the zero page locations to use. We've tracked the used
+    ** ZP locations, so try to find some for us that are unused.
+    */
+    if ((D->ZPUsage & REG_PTR1) == REG_NONE) {
         D->ZPLo = "ptr1";
         D->ZPHi = "ptr1+1";
-    } else if ((D->UsedRegs & REG_SREG) == REG_NONE) {
+    } else if ((D->ZPUsage & REG_SREG) == REG_NONE) {
         D->ZPLo = "sreg";
         D->ZPHi = "sreg+1";
-    } else if ((D->UsedRegs & REG_PTR2) == REG_NONE) {
+    } else if ((D->ZPUsage & REG_PTR2) == REG_NONE) {
         D->ZPLo = "ptr2";
         D->ZPHi = "ptr2+1";
     } else {
@@ -1959,7 +1988,7 @@ unsigned OptStackOps (CodeSeg* S)
                         break;
                     } else {
                         /* Track register usage */
-                        Data.UsedRegs |= (E->Use | E->Chg);
+                        Data.ZPUsage |= (E->Use | E->Chg);
                         TrackLoads (&Data.Rhs, E, I);
                     }
 
@@ -1991,7 +2020,7 @@ unsigned OptStackOps (CodeSeg* S)
 
                 } else {
                     /* Other stuff: Track register usage */
-                    Data.UsedRegs |= (E->Use | E->Chg);
+                    Data.ZPUsage |= (E->Use | E->Chg);
                     TrackLoads (&Data.Rhs, E, I);
                 }
                 /* If the registers from the push (A/X) are used before they're
@@ -2009,21 +2038,32 @@ unsigned OptStackOps (CodeSeg* S)
 
             case FoundOp:
                 /* Track zero page location usage beyond this point */
-                Data.UsedRegs |= GetRegInfo (S, I, REG_SREG | REG_PTR1 | REG_PTR2);
+                Data.ZPUsage |= GetRegInfo (S, I, REG_SREG | REG_PTR1 | REG_PTR2);
 
                 /* Finalize the load info */
                 FinalizeLoadInfo (&Data.Lhs, S);
                 FinalizeLoadInfo (&Data.Rhs, S);
 
-                /* If the Lhs loads do load from zeropage, we have to include
-                ** them into UsedRegs registers used. The Rhs loads have already
-                ** been tracked.
+                /* Check if the lhs loads from zeropage. If this is true, these
+                ** zero page locations have to be added to ZPUsage, because
+                ** they cannot be used for intermediate storage. In addition,
+                ** if one of these zero page locations is destroyed between
+                ** pushing the lhs and the actual operation, we cannot use the
+                ** original zero page locations for the final op, but must
+                ** use another ZP location to save them.
                 */
+                ChangedRegs &= REG_ZP;
                 if (Data.Lhs.A.LoadEntry && Data.Lhs.A.LoadEntry->AM == AM65_ZP) {
-                    Data.UsedRegs |= Data.Lhs.A.LoadEntry->Use;
+                    Data.ZPUsage |= Data.Lhs.A.LoadEntry->Use;
+                    if ((Data.Lhs.A.LoadEntry->Use & ChangedRegs) != 0) {
+                        Data.Lhs.A.Flags &= ~(LI_DIRECT | LI_RELOAD_Y);
+                    }
                 }
                 if (Data.Lhs.X.LoadEntry && Data.Lhs.X.LoadEntry->AM == AM65_ZP) {
-                    Data.UsedRegs |= Data.Lhs.X.LoadEntry->Use;
+                    Data.ZPUsage |= Data.Lhs.X.LoadEntry->Use;
+                    if ((Data.Lhs.X.LoadEntry->Use & ChangedRegs) != 0) {
+                        Data.Lhs.X.Flags &= ~(LI_DIRECT | LI_RELOAD_Y);
+                    }
                 }
 
                 /* Check the preconditions. If they aren't ok, reset the insn

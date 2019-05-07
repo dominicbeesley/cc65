@@ -4,7 +4,6 @@
 <title>cc65 Users Guide
 <author><url url="mailto:uz@cc65.org" name="Ullrich von Bassewitz">,<newline>
 <url url="mailto:gregdk@users.sf.net" name="Greg King">
-<date>2017-05-20
 
 <abstract>
 cc65 is a C compiler for 6502 targets. It supports several 6502 based home
@@ -407,6 +406,7 @@ Here is a description of all the command line options:
   <item>sim6502
   <item>sim65c02
   <item>supervision
+  <item>telestrat
   <item>vic20
   </itemize>
 
@@ -776,6 +776,25 @@ This cc65 version has some extensions to the ISO C standard.
         size zero, even if it is initialized.
         <p>
 
+<item>  Computed gotos, a GCC extension, has limited support. With it you can
+        use fast jump tables from C. You can take the address of a label with
+        a double ampersand, putting them in a static const array of type void *.
+        Then you can jump to one of these labels as follows:
+
+        <tscreen><verb>
+        static const void * const jumptable[] = {
+                &amp;&amp;add,
+                &amp;&amp;sub
+        };
+        goto *jumptable[somevar];
+
+        add:
+        ...code...
+        </verb></tscreen>
+
+        In the jump table, no expressions are supported. The array index
+        used in the goto must be a simple variable or a constant.
+
 </itemize>
 <p>
 
@@ -941,6 +960,10 @@ The compiler defines several macros at startup:
 
   This macro is defined if the target is the Supervision (-t supervision).
 
+  <tag><tt>__TELESTRAT__</tt></tag>
+
+  This macro is defined if the target is the Telestrat (-t telestrat).
+  
   <tag><tt>__TIME__</tt></tag>
 
   This macro expands to the time of translation of the preprocessing
@@ -1117,6 +1140,23 @@ parameter with the <tt/#pragma/.
   output immediately, which means that they go into the currently active data
   or rodata segment, but cannot be merged. When inactive, string literals are
   remembered and output as a whole when translation is finished.
+
+
+<sect1><tt>#pragma message (&lt;message&gt;)</tt><label id="pragma-message"><p>
+
+  This pragma is used to display informational messages at compile-time.
+
+  The message intented to be displayed must be a string literal.
+
+  Example:
+  <tscreen><verb>
+        #pragma message ("in a bottle")
+  </verb></tscreen>
+
+  Results in the compiler outputting the following to stderr:
+  <tscreen><verb>
+        example.c(42): Note: in a bottle
+  </verb></tscreen>
 
 
 <sect1><tt>#pragma optimize ([push,] on|off)</tt><label id="pragma-optimize"><p>

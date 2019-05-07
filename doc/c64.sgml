@@ -1,11 +1,9 @@
 <!doctype linuxdoc system>
 
 <article>
-
 <title>Commodore 64-specific information for cc65
 <author><url url="mailto:uz@cc65.org" name="Ullrich von Bassewitz"><newline>
 <url url="mailto:greg.king5@verizon.net" name="Greg King">
-<date>2017-01-18
 
 <abstract>
 An overview over the C64 runtime system as it is implemented for the cc65 C
@@ -122,8 +120,8 @@ since the program must be loaded to the BASIC start address.
 <sect1>80 Columns conio driver<p>
 
 The C64 package comes with an alternative software driven 80 columns
-module <tt/c64-soft80.o/ which uses the memory under I/O between &dollar;d000
-and &dollar;ffff.
+module <tt/c64-soft80.o/ which uses the memory under I/O between &dollar;D000
+and &dollar;FF3F.
 
 In memory constrained situations the memory from &dollar;400 to &dollar;7FF
 can be made available to a program by calling <tt/_heapadd ((void *) 0x0400, 0x0400);/
@@ -169,6 +167,33 @@ url="funcref.html" name="function reference"> for declaration and usage.
 </itemize>
 
 
+<sect1>C64-specific accelerator functions<p>
+
+The functions listed below are accelerator functions for the C64. See the <url
+url="funcref.html" name="function reference"> for declaration and usage.
+
+<itemize>
+<item>detect_c128
+<item>detect_c64dtv
+<item>detect_c65
+<item>detect_chameleon
+<item>detect_scpu
+<item>detect_turbomaster
+<item>get_c128_speed
+<item>get_c64dtv_speed
+<item>get_c65_speed
+<item>get_chameleon_speed
+<item>get_scpu_speed
+<item>get_turbomaster_speed
+<item>set_c128_speed
+<item>set_c64dtv_speed
+<item>set_c65_speed
+<item>set_chameleon_speed
+<item>set_scpu_speed
+<item>set_turbomaster_speed
+</itemize>
+
+
 <sect1>CBM-specific functions<p>
 
 Some functions are available for all (or at least most) of the Commodore
@@ -190,6 +215,8 @@ declaration and usage.
 <item>cbm_k_basin
 <item>cbm_k_bsout
 <item>cbm_k_clrch
+<item>cbm_k_tksa
+<item>cbm_k_second
 <item>cbm_load
 <item>cbm_open
 <item>cbm_opendir
@@ -291,7 +318,7 @@ Note that the graphics drivers are incompatible with the
   bytes each. Written and contributed by Marco van den Heuvel.
 
   <tag><tt/c64-ram.emd (c64_ram_emd)/</tag>
-  A driver for the hidden RAM below the I/O area and kernal ROM. Supports 48
+  A driver for the hidden RAM below the I/O area and kernal ROM. Supports 47
   256 byte pages. Please note that this driver is incompatible with any of the
   graphics drivers, or the soft80 conio driver!
 
@@ -300,10 +327,8 @@ Note that the graphics drivers are incompatible with the
   Will test the hardware for the available RAM.
 
   <tag><tt/c64-reu.emd (c64_reu_emd)/</tag>
-  A driver for the CBM REUs. The driver will determine from the connected REU
-  if it supports 128KB of RAM or more. In the latter case, 256KB are assumed,
-  but since there are no range checks, the application can use more memory if
-  it has better knowledge about the hardware than the driver.
+  A driver for the CBM REUs. The driver will test the connected REU to find
+  out how much RAM is present.
 
   <tag><tt/c64-vdc.emd (c64_vdc_emd)/</tag>
   A driver for the VDC memory of the C128. Written and contributed by Maciej
@@ -393,6 +418,13 @@ The default drivers, <tt/mouse_stddrv (mouse_static_stddrv)/, point to <tt/c64-1
 <sect>Limitations<p>
 
 
+<sect1>Realtime clock<p>
+
+The realtime clock functions use the CIA1 TOD clock. As that clock only stores
+the time but not the date, the date set by <tt/clock_settime()/ is simply stored
+inside the C library for retrieval in the same program via <tt/clock_gettime()/.
+
+
 
 <sect>Other hints<p>
 
@@ -449,14 +481,14 @@ including commercial applications, and to alter it and redistribute it
 freely, subject to the following restrictions:
 
 <enum>
-<item>	The origin of this software must not be misrepresented; you must not
-	claim that you wrote the original software. If you use this software
-	in a product, an acknowledgment in the product documentation would be
-	appreciated but is not required.
-<item>	Altered source versions must be plainly marked as such, and must not
-	be misrepresented as being the original software.
-<item>	This notice may not be removed or altered from any source
-	distribution.
+<item>  The origin of this software must not be misrepresented; you must not
+        claim that you wrote the original software. If you use this software
+        in a product, an acknowledgment in the product documentation would be
+        appreciated but is not required.
+<item>  Altered source versions must be plainly marked as such, and must not
+        be misrepresented as being the original software.
+<item>  This notice may not be removed or altered from any source
+        distribution.
 </enum>
 
 </article>

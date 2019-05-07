@@ -136,6 +136,8 @@ SymEntry* FindTagSym (const char* Name);
 SymEntry* FindStructField (const Type* TypeArray, const char* Name);
 /* Find a struct field in the fields list */
 
+unsigned short FindSPAdjustment (const char* Name);
+/* Search for an entry in the table of SP adjustments */
 
 
 /*****************************************************************************/
@@ -175,6 +177,9 @@ SymTable* GetSymTab (void);
 
 SymTable* GetGlobalSymTab (void);
 /* Return the global symbol table */
+
+SymTable* GetLabelSymTab (void);
+/* Return the label symbol table */
 
 int SymIsLocal (SymEntry* Sym);
 /* Return true if the symbol is defined in the highest lexical level */

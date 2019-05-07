@@ -78,6 +78,7 @@ typedef enum {
     PRAGMA_DATASEG,                                     /* obsolete */
     PRAGMA_INLINE_STDFUNCS,
     PRAGMA_LOCAL_STRINGS,
+    PRAGMA_MESSAGE,
     PRAGMA_OPTIMIZE,
     PRAGMA_REGISTER_VARS,
     PRAGMA_REGVARADDR,
@@ -114,6 +115,7 @@ static const struct Pragma {
     { "dataseg",                PRAGMA_DATASEG            },      /* obsolete */
     { "inline-stdfuncs",        PRAGMA_INLINE_STDFUNCS    },
     { "local-strings",          PRAGMA_LOCAL_STRINGS      },
+    { "message",                PRAGMA_MESSAGE            },
     { "optimize",               PRAGMA_OPTIMIZE           },
     { "register-vars",          PRAGMA_REGISTER_VARS      },
     { "regvaraddr",             PRAGMA_REGVARADDR         },
@@ -354,7 +356,7 @@ static int BoolKeyword (StrBuf* Ident)
     }
 
     /* Error */
-    Error ("Pragma argument must be one of `on', `off', `true' or `false'");
+    Error ("Pragma argument must be one of 'on', 'off', 'true' or 'false'");
     return 0;
 }
 
@@ -451,7 +453,7 @@ static void SegNamePragma (StrBuf* B, segment_t Seg)
     } else {
 
         /* Segment name is invalid */
-        Error ("Illegal segment name: `%s'", Name);
+        Error ("Illegal segment name: '%s'", Name);
 
     }
 
@@ -523,7 +525,7 @@ static void WrappedCallPragma (StrBuf* B)
     /* Check if the name is valid */
     if (Entry && Entry->Flags & SC_FUNC) {
 
-        PushWrappedCall(Entry, Val);
+        PushWrappedCall(Entry, (unsigned char) Val);
         Entry->Flags |= SC_REF;
         Entry->V.F.Func->Flags |= FD_CALL_WRAPPER;
 
@@ -750,6 +752,13 @@ static void IntPragma (StrBuf* B, IntStack* Stack, long Low, long High)
 
 
 
+static void MakeMessage (const char* Message)
+{
+    fprintf (stderr, "%s(%u): Note: %s\n", GetInputName (CurTok.LI), GetInputLine (CurTok.LI), Message);
+}
+
+
+
 static void ParsePragma (void)
 /* Parse the contents of the _Pragma statement */
 {
@@ -779,7 +788,7 @@ static void ParsePragma (void)
         ** for unknown pragmas, but warn about them if enabled (the default).
         */
         if (IS_Get (&WarnUnknownPragma)) {
-            Warning ("Unknown pragma `%s'", SB_GetConstBuf (&Ident));
+            Warning ("Unknown pragma '%s'", SB_GetConstBuf (&Ident));
         }
         goto ExitPoint;
     }
@@ -849,6 +858,10 @@ static void ParsePragma (void)
             FlagPragma (&B, &LocalStrings);
             break;
 
+        case PRAGMA_MESSAGE:
+            StringPragma (&B, MakeMessage);
+            break;
+
         case PRAGMA_OPTIMIZE:
             FlagPragma (&B, &Optimize);
             break;
@@ -885,9 +898,9 @@ static void ParsePragma (void)
             FlagPragma (&B, &StaticLocals);
             break;
 
-	case PRAGMA_WRAPPED_CALL:
-	    WrappedCallPragma(&B);
-	    break;
+        case PRAGMA_WRAPPED_CALL:
+            WrappedCallPragma(&B);
+            break;
 
         case PRAGMA_WARN:
             WarnPragma (&B);

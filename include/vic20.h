@@ -77,6 +77,15 @@
 
 
 
+/* Masks for joy_read */
+#define JOY_UP_MASK             0x01
+#define JOY_DOWN_MASK           0x02
+#define JOY_LEFT_MASK           0x04
+#define JOY_RIGHT_MASK          0x08
+#define JOY_BTN_1_MASK          0x10
+
+
+
 /* Define hardware */
 #include <_vic.h>
 #define VIC     (*(struct __vic*)0x9000)
@@ -96,7 +105,8 @@
 extern void vic20_ptvjoy_joy[];
 extern void vic20_stdjoy_joy[];         /* Referred to by joy_static_stddrv[] */
 
-
+extern void vic20_rama_emd[];
+extern void vic20_georam_emd[];
 
 /* End of vic20.h */
 #endif

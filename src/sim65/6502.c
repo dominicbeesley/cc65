@@ -37,8 +37,6 @@
    BBRx, BBSx, RMBx, SMBx, WAI, and STP are unsupported
  * BCD flag handling equals 6502 (unchecked if bug is simulated or wrong for
    6502)
- * one cycle win for fetch-modify-write instructions ignored
-   (e.g., ROL abs,x takes only 6 cycles if no page break occurs)
 */
 
 #include "memory.h"
@@ -629,6 +627,8 @@ static void OPC_6502_1E (void)
     unsigned Val;
     Cycles = 7;
     Addr = MemReadWord (Regs.PC+1) + Regs.XR;
+    if (CPU != CPU_6502 && !PAGE_CROSS (Addr, Regs.XR))
+        --Cycles;
     Val = MemReadByte (Addr) << 1;
     MemWriteByte (Addr, (unsigned char) Val);
     TEST_ZF (Val & 0xFF);
@@ -739,7 +739,7 @@ static void OPC_6502_2C (void)
     unsigned Addr;
     unsigned char Val;
     Cycles = 4;
-    Addr = MemReadByte (Regs.PC+1);
+    Addr = MemReadWord (Regs.PC+1);
     Val = MemReadByte (Addr);
     SET_SF (Val & 0x80);
     SET_OF (Val & 0x40);
@@ -898,6 +898,8 @@ static void OPC_6502_3E (void)
     unsigned Val;
     Cycles = 7;
     Addr = MemReadWord (Regs.PC+1) + Regs.XR;
+    if (CPU != CPU_6502 && !PAGE_CROSS (Addr, Regs.XR))
+        --Cycles;
     Val = MemReadByte (Addr);
     ROL (Val);
     MemWriteByte (Addr, Val);
@@ -1132,6 +1134,8 @@ static void OPC_6502_5E (void)
     unsigned char Val;
     Cycles = 7;
     Addr = MemReadWord (Regs.PC+1) + Regs.XR;
+    if (CPU != CPU_6502 && !PAGE_CROSS (Addr, Regs.XR))
+        --Cycles;
     Val = MemReadByte (Addr);
     SET_CF (Val & 0x01);
     Val >>= 1;
@@ -1266,6 +1270,8 @@ static void OPC_6502_6C (void)
         Cycles = 6;
         Regs.PC = MemReadWord(Lo);
     }
+    
+    ParaVirtHooks (&Regs);    
 }
 
 
@@ -1276,6 +1282,8 @@ static void OPC_65C02_6C (void)
     /* 6502 bug fixed here */
     Cycles = 5;
     Regs.PC = MemReadWord (MemReadWord (Regs.PC+1));
+
+    ParaVirtHooks (&Regs);    
 }
 
 
@@ -1430,6 +1438,8 @@ static void OPC_65SC02_7C (void)
     PC = Regs.PC;
     Adr = MemReadWord (PC+1);
     Regs.PC = MemReadWord(Adr+Regs.XR);
+
+    ParaVirtHooks (&Regs);    
 }
 
 
@@ -1456,6 +1466,8 @@ static void OPC_6502_7E (void)
     unsigned Val;
     Cycles = 7;
     Addr = MemReadWord (Regs.PC+1) + Regs.XR;
+    if (CPU != CPU_6502 && !PAGE_CROSS (Addr, Regs.XR))
+        --Cycles;
     Val = MemReadByte (Addr);
     ROR (Val);
     MemWriteByte (Addr, Val);

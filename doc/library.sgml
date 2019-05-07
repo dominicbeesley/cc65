@@ -1,10 +1,8 @@
 <!doctype linuxdoc system>
 
 <article>
-
 <title>cc65 Library Overview
 <author><url url="mailto:uz@cc65.org" name="Ullrich von Bassewitz">
-<date>2014-04-12
 
 <abstract>
 An overview over the runtime and C libraries that come with the cc65 compiler,
@@ -43,7 +41,7 @@ Functions that are <em/not/ available:
 <itemize>
   <item><tt>tmpfile/tmpnam</tt>
   <p>
-  <item><tt>system</tt>
+  <item><tt>system</tt> (cc65 alternative <tt>exec</tt>)
   <p>
   <item>All functions that handle floating point numbers in some manner.
   <p>
@@ -164,6 +162,7 @@ portable. conio implementations exist for the following targets:
   <item>apple2
   <item>apple2enh
   <item>atari
+  <item>atari5200
   <item>atarixl
   <item>atmos
   <item>c16 (works also for the c116 with up to 32K memory)
@@ -172,10 +171,15 @@ portable. conio implementations exist for the following targets:
   <item>plus4 (or expanded c16/c116)
   <item>cbm510 (40 column video)
   <item>cbm610 (all CBM series-II computers with 80 column video)
+  <item>creativision
+  <item>gamate
   <item>geos-apple
   <item>geos-cbm
   <item>nes
+  <item>osic1p
+  <item>pce
   <item>pet (all CBM PET systems except the 2001)
+  <item>telestrat
   <item>vic20
   </itemize>
 
@@ -204,6 +208,7 @@ the following targets:
   <item>atarixl
   <item>c64
   <item>c128
+  <item>cbm510
   </itemize>
 
 The available functions are declared in <tt/mouse.h/.
@@ -224,17 +229,14 @@ including commercial applications, and to alter it and redistribute it
 freely, subject to the following restrictions:
 
 <enum>
-<item>	The origin of this software must not be misrepresented; you must not
-	claim that you wrote the original software. If you use this software
-	in a product, an acknowledgment in the product documentation would be
-	appreciated but is not required.
-<item>	Altered source versions must be plainly marked as such, and must not
-	be misrepresented as being the original software.
-<item>	This notice may not be removed or altered from any source
-	distribution.
+<item>  The origin of this software must not be misrepresented; you must not
+        claim that you wrote the original software. If you use this software
+        in a product, an acknowledgment in the product documentation would be
+        appreciated but is not required.
+<item>  Altered source versions must be plainly marked as such, and must not
+        be misrepresented as being the original software.
+<item>  This notice may not be removed or altered from any source
+        distribution.
 </enum>
 
 </article>
-
-
-
