@@ -100,7 +100,14 @@ $(INSTALL) -m0644 ../$(dir)/*.* $(DESTDIR)$(datadir)/$(dir)
 endef # INSTALL_recipe
 
 install:
+
+
 	$(foreach dir,$(OUTPUTDIRS),$(INSTALL_recipe))
+	
+	$(INSTALL) -d $(DESTDIR)$(datadir)/include
+	$(INSTALL) -d $(DESTDIR)$(datadir)/include/oslib
+	$(INSTALL) -m0644 bbc/oslib/*.h $(DESTDIR)$(datadir)/include/oslib
+	$(INSTALL) -m0644 bbc/oslib/*.inc $(DESTDIR)$(datadir)/include/oslib
 
 endif # CMD_EXE
 

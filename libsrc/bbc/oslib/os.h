@@ -1,6 +1,10 @@
 #ifndef os_H
 #define os_H
 
+
+void OSWRCH(char);
+void OSASCI(char);
+
 /* C header file for OS
  * written by DefMod (May  4 2004) on Tue May  4 13:27:32 2004
  * Jonathan Coxhead, jonathan@doves.demon.co.uk, 9 Feb 1997

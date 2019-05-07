@@ -7,3 +7,9 @@
 /testwrk/
 /wrk/
 /cc65.zip
+cfg/bbc.cfg.org
+libsrc/bbc/clib/Makefile~
+*~
+*.o
+*.bak
+
