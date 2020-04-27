@@ -65,6 +65,8 @@
 #  include <cbm610.h>
 #elif defined(__PET__)    && !defined(_PET_H)
 #  include <pet.h>
+#elif defined(__CX16__)   && !defined(_CX16_H)
+#  include <cx16.h>
 #endif
 
 /* Include definitions for CBM file types */
@@ -119,6 +121,8 @@ extern char _filetype;          /* Defaults to 's' */
 #define CH_STOP           3
 #define CH_LIRA          92
 #define CH_ESC           27
+#define CH_FONT_LOWER    14
+#define CH_FONT_UPPER   142
 
 
 
@@ -164,7 +168,7 @@ unsigned char __fastcall__ kbrepeat (unsigned char mode);
 
 #if !defined(__CBM610__) && !defined(__PET__)
 void waitvsync (void);
-/* Wait for the start of the next frame */
+/* Wait for the start of the next video field. */
 #endif
 
 /*****************************************************************************/
@@ -204,6 +208,7 @@ void __fastcall__ cbm_k_second (unsigned char addr);
 void __fastcall__ cbm_k_setlfs (unsigned char LFN, unsigned char DEV,
                                 unsigned char SA);
 void __fastcall__ cbm_k_setnam (const char* Name);
+void __fastcall__ cbm_k_settim (unsigned long timer);
 void __fastcall__ cbm_k_talk (unsigned char dev);
 void __fastcall__ cbm_k_tksa (unsigned char addr);
 void cbm_k_udtim (void);
@@ -300,5 +305,3 @@ void __fastcall__ cbm_closedir (unsigned char lfn);
 
 /* End of cbm.h */
 #endif
-
-

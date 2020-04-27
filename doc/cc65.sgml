@@ -84,7 +84,8 @@ Long options:
   --data-name seg               Set the name of the DATA segment
   --debug                       Debug mode
   --debug-info                  Add debug info to object file
-  --debug-opt name              Debug optimization steps
+  --debug-opt name              Configure optimizations with a file
+  --debug-opt-output            Debug output of each optimization step
   --dep-target target           Use this dependency target
   --disable-opt name            Disable an optimization step
   --eagerly-inline-funcs        Eagerly inline some known functions
@@ -193,8 +194,26 @@ Here is a description of all the command line options:
 
   <tag><tt>-d, --debug</tt></tag>
 
-  Enables debug mode, something that should not be needed for mere
-  mortals:-)
+  Enables debug mode, for debugging the behavior of cc65.
+
+
+  <tag><tt>--debug-opt name</tt></tag>
+
+  The named file contains a list of specific optimization steps to enable or disable.
+  Each line contains the name of an optimization step with either a
+  <tt>+</tt> (enable) or <tt>-</tt> (disable) prefix.
+  The name <tt>all</tt> can be used to enable or disable all optimizations.
+  Comment lines may begin with <tt>#</tt> or <tt>;</tt>.
+
+  Use <tt>--list-opt-steps</tt> to generate a complete list of available optimization steps.
+
+  Use <tt>--debug</tt> to see a list of optimizations applied during compilation.
+
+
+  <tag><tt>--debug-opt-output</tt></tag>
+
+  For debugging the output of each optimization pass, step by step.
+  Generates a <tt>name.opt</tt> output listing for each optimized function <tt>name</tt>.
 
 
   <label id="option-dep-target">
@@ -230,7 +249,6 @@ Here is a description of all the command line options:
   <item><tt/strcmp()/
   <item><tt/strcpy()/
   <item><tt/strlen()/
-  <item>most of the functions declared in <tt/&lt;ctype.h&gt;/
   </itemize>
 
   Note: This has two consequences:
@@ -240,9 +258,7 @@ Here is a description of all the command line options:
         using <tt/--eagerly-inline-funcs/ actually will break things.
         <p>
   <item>The inlined string and memory functions will not handle strings or
-        memory areas larger than 255 bytes.  Similarly, the inlined <tt/is..()/
-        functions will not work with values outside the char. range (such as
-        <tt/EOF/).
+        memory areas larger than 255 bytes.
         <p>
   </itemize>
 
@@ -795,6 +811,14 @@ This cc65 version has some extensions to the ISO C standard.
         In the jump table, no expressions are supported. The array index
         used in the goto must be a simple variable or a constant.
 
+<item>  Binary literals, a C++14 feature and a GCC C extension, are accepted.
+        They can be disabled with the <tt><ref id="option--standard"
+        name="--standard"></tt> option.
+
+        <tscreen><verb>
+        unsigned char foo = 0b101; // sets it to 5
+        </verb></tscreen>
+
 </itemize>
 <p>
 
@@ -873,6 +897,10 @@ The compiler defines several macros at startup:
   <item><tt/__CC65_STD_C99__/
   <item><tt/__CC65_STD_CC65__/
   </itemize>
+
+  <tag><tt>__CX16__</tt></tag>
+
+  This macro is defined if the target is the Commander X16 (-t cx16).
 
   <tag><tt>__DATE__</tt></tag>
 
@@ -1448,10 +1476,16 @@ Or, to access a struct member of a static variable:
             unsigned char x;
             unsigned char y;
             unsigned char color;
+            unsigned char data[32];
         } pixel_t;
         static pixel_t pixel;
         __asm__ ("ldy #%b", offsetof(pixel_t, color));
         __asm__ ("lda %v,y", pixel);
+
+        /* or to access an array member */
+        static unsigned char i;
+        __asm__ ("ldy %v", i);
+        __asm__ ("lda %v+%b,y", pixel, offsetof(pixel_t, data));
 </verb></tscreen>
 <p>
 The next example shows how to use global variables to exchange data between C

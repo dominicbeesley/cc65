@@ -90,15 +90,15 @@ ifneq ($(filter disk samples.%,$(MAKECMDGOALS)),)
   # For this one, see https://applecommander.github.io/
   AC ?= ac.jar
 
-  # For this one, see http://www.horus.com/~hias/atari/
+  # For this one, see https://www.horus.com/~hias/atari/
   DIR2ATR ?= dir2atr
-
-  DISK_c64       = samples.d64
-  DISK_apple2    = samples.dsk
-  DISK_apple2enh = samples.dsk
-  DISK_atari     = samples.atr
-  DISK_atarixl   = samples.atr
 endif
+
+DISK_c64       = samples.d64
+DISK_apple2    = samples.dsk
+DISK_apple2enh = samples.dsk
+DISK_atari     = samples.atr
+DISK_atarixl   = samples.atr
 
 # --------------------------------------------------------------------------
 # System-dependent settings
@@ -198,6 +198,9 @@ EXELIST_atarixl = $(EXELIST_atari)
 
 EXELIST_atari2600 = \
         atari2600hello
+        
+EXELIST_supervision = \
+        supervisionhello
 
 # Unlisted targets will try to build everything.
 # That lets us learn what they cannot build, and what settings
