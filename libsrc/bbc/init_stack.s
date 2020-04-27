@@ -11,17 +11,17 @@ init_stack:
 
 	; put the stack at the top of memory HIMEM before screen
 	
-	lda	#osbyte_READ_TOP
-	jsr	OSBYTE
-	tya
-	sta	sp+1   		; Set argument stack ptr
-	txa
-     	sta	sp              ; #<(__RAM_START__ + __RAM_SIZE__)
+;	lda	#osbyte_READ_TOP
+;	jsr	OSBYTE
+;	tya
+;	sta	sp+1   		; Set argument stack ptr
+;	txa
+ ;    	sta	sp              ; #<(__RAM_START__ + __RAM_SIZE__)
 
 	; put the stack in the BASIC work area &400-7FF
-;	lda	#$ff
-;	sta	sp
-;	lda	#$7
-;	sta	sp + 1
+	lda	#$ff
+	sta	sp
+	lda	#$7
+	sta	sp + 1
 
 	rts
