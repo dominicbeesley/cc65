@@ -29,15 +29,15 @@
 */
 
 #ifndef types_H
-#include "oslib/types.h"
+#include <oslib/types.h>
 #endif
 
 #ifndef os_H
-#include "oslib/os.h"
+#include <oslib/os.h>
 #endif
 
 #ifndef fileswitch_H
-#include "oslib/fileswitch.h"
+#include <oslib/fileswitch.h>
 #endif
 
 #if defined NAMESPACE_OSLIB
@@ -185,14 +185,17 @@ extern fileswitch_object_type osfile_delete (char const *file_name,
  * Other notes:   Calls SWI 0x8 with R0 = 0xFF, R3 = 0x0.
  */
 
-extern os_error *xosfile_load (char const *file_name,
+//TODO: change to fastcall!
+//TODO: doesn't set return valueS?!
+
+extern os_error * __cdecl__ xosfile_load (char const *file_name,
       byte *addr,
       fileswitch_object_type *obj_type,
       bits32 *load_addr,
       bits32 *exec_addr,
       long *size,
       fileswitch_attr *attr);
-extern fileswitch_object_type osfile_load (char const *file_name,
+extern fileswitch_object_type __cdecl__ osfile_load (char const *file_name,
       byte *addr,
       bits32 *load_addr,
       bits32 *exec_addr,

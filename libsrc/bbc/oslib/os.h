@@ -31,7 +31,7 @@ void OSASCI(char);
 */
 
 #ifndef types_H
-#include "oslib/types.h"
+#include <oslib/types.h>
 #endif
 
 #if defined NAMESPACE_OSLIB
