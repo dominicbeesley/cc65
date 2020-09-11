@@ -309,26 +309,49 @@ static void WhileStatement (void)
 static void ReturnStatement (void)
 /* Handle the 'return' statement */
 {
-    ExprDesc Expr;
+    ExprDesc    Expr;
+    const Type* ReturnType;
 
+    ED_Init (&Expr);
     NextToken ();
     if (CurTok.Tok != TOK_SEMI) {
 
         /* Evaluate the return expression */
         hie0 (&Expr);
 
-        /* If we return something in a void function, print an error and
-        ** ignore the value. Otherwise convert the value to the type of the
-        ** return.
+        /* If we return something in a function with void or incomplete return
+        ** type, print an error and ignore the value. Otherwise convert the
+        ** value to the type of the return.
         */
         if (F_HasVoidReturn (CurrentFunc)) {
-            Error ("Returning a value in function with return type void");
+            Error ("Returning a value in function with return type 'void'");
         } else {
-            /* Convert the return value to the type of the function result */
-            TypeConversion (&Expr, F_GetReturnType (CurrentFunc));
 
-            /* Load the value into the primary */
-            LoadExpr (CF_NONE, &Expr);
+            /* Check the return type first */
+            ReturnType = F_GetReturnType (CurrentFunc);
+            if (IsIncompleteESUType (ReturnType)) {
+                /* Avoid excess errors */
+                if (ErrorCount == 0) {
+                    Error ("Returning a value in function with incomplete return type");
+                }
+            } else {
+                /* Convert the return value to the type of the function result */
+                TypeConversion (&Expr, ReturnType);
+
+                /* Load the value into the primary */
+                if (IsClassStruct (Expr.Type)) {
+                    /* Handle struct/union specially */
+                    ReturnType = GetStructReplacementType (Expr.Type);
+                    if (ReturnType == Expr.Type) {
+                        Error ("Returning '%s' of this size by value is not supported", GetFullTypeName (Expr.Type));
+                    }
+                    LoadExpr (TypeOf (ReturnType), &Expr);
+
+                } else {
+                    /* Load the value into the primary */
+                    LoadExpr (CF_NONE, &Expr);
+                }
+            }
         }
 
     } else if (!F_HasVoidReturn (CurrentFunc) && !F_HasOldStyleIntRet (CurrentFunc)) {
@@ -412,8 +435,6 @@ static void ContinueStatement (void)
 static void ForStatement (void)
 /* Handle a 'for' statement */
 {
-    ExprDesc lval1;
-    ExprDesc lval3;
     int HaveIncExpr;
     CodeMark IncExprStart;
     CodeMark IncExprEnd;
@@ -438,6 +459,10 @@ static void ForStatement (void)
 
     /* Parse the initializer expression */
     if (CurTok.Tok != TOK_SEMI) {
+        /* The value of the expression is unused */
+        ExprDesc lval1;
+        ED_Init (&lval1);
+        lval1.Flags = E_NEED_NONE;
         Expression0 (&lval1);
     }
     ConsumeSemi ();
@@ -463,6 +488,10 @@ static void ForStatement (void)
     /* Parse the increment expression */
     HaveIncExpr = (CurTok.Tok != TOK_RPAREN);
     if (HaveIncExpr) {
+        /* The value of the expression is unused */
+        ExprDesc lval3;
+        ED_Init (&lval3);
+        lval3.Flags = E_NEED_NONE;
         Expression0 (&lval3);
     }
 
@@ -568,7 +597,10 @@ int Statement (int* PendingToken)
 {
     ExprDesc Expr;
     int GotBreak;
+    unsigned PrevErrorCount;
     CodeMark Start, End;
+
+    ED_Init (&Expr);
 
     /* Assume no pending token */
     if (PendingToken) {
@@ -653,24 +685,24 @@ int Statement (int* PendingToken)
             break;
 
         default:
-            /* Remember the current code position */
+            /* Remember the current error count and code position */
+            PrevErrorCount = ErrorCount;
             GetCodePos (&Start);
+
             /* Actual statement */
-            ExprWithCheck (hie0, &Expr);
-            /* Load the result only if it is an lvalue and the type is
-            ** marked as volatile. Otherwise the load is useless.
-            */
-            if (ED_IsLVal (&Expr) && IsQualVolatile (Expr.Type)) {
-                LoadExpr (CF_NONE, &Expr);
-            }
+            Expr.Flags |= E_NEED_NONE;
+            Expression0 (&Expr);
+
             /* If the statement didn't generate code, and is not of type
             ** void, emit a warning.
             */
             GetCodePos (&End);
-            if (CodeRangeIsEmpty (&Start, &End) &&
-                !IsTypeVoid (Expr.Type)         &&
-                IS_Get (&WarnNoEffect)) {
-                Warning ("Statement has no effect");
+            if (!ED_YetToLoad (&Expr)           &&
+                !ED_MayHaveNoEffect (&Expr)     &&
+                CodeRangeIsEmpty (&Start, &End) &&
+                IS_Get (&WarnNoEffect)          &&
+                PrevErrorCount == ErrorCount) {
+                Warning ("Expression result unused");
             }
             CheckSemi (PendingToken);
     }

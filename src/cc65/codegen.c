@@ -33,6 +33,7 @@
 
 
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -100,12 +101,17 @@ static const char* GetLabelName (unsigned Flags, uintptr_t Label, long Offs)
     /* Create the correct label name */
     switch (Flags & CF_ADDRMASK) {
 
+        case CF_IMM:
+            /* Immediate constant values */
+            xsprintf (Buf, sizeof (Buf), "$%04X", (unsigned)((Offs) & 0xFFFF));
+            break;
+
         case CF_STATIC:
-            /* Static memory cell */
+            /* Local static memory cell */
             if (Offs) {
-                xsprintf (Buf, sizeof (Buf), "%s%+ld", LocalLabelName (Label), Offs);
+                xsprintf (Buf, sizeof (Buf), "%s%+ld", LocalDataLabelName (Label), Offs);
             } else {
-                xsprintf (Buf, sizeof (Buf), "%s", LocalLabelName (Label));
+                xsprintf (Buf, sizeof (Buf), "%s", LocalDataLabelName (Label));
             }
             break;
 
@@ -118,6 +124,16 @@ static const char* GetLabelName (unsigned Flags, uintptr_t Label, long Offs)
             }
             break;
 
+        case CF_LITERAL:
+            /* Literal */
+            /* Static memory cell */
+            if (Offs) {
+                xsprintf (Buf, sizeof (Buf), "%s%+ld", PooledLiteralLabelName (Label), Offs);
+            } else {
+                xsprintf (Buf, sizeof (Buf), "%s", PooledLiteralLabelName (Label));
+            }
+            break;
+
         case CF_ABSOLUTE:
             /* Absolute address */
             xsprintf (Buf, sizeof (Buf), "$%04X", (unsigned)((Label+Offs) & 0xFFFF));
@@ -126,6 +142,15 @@ static const char* GetLabelName (unsigned Flags, uintptr_t Label, long Offs)
         case CF_REGVAR:
             /* Variable in register bank */
             xsprintf (Buf, sizeof (Buf), "regbank+%u", (unsigned)((Label+Offs) & 0xFFFF));
+            break;
+
+        case CF_CODE:
+            /* Code label location */
+            if (Offs) {
+                xsprintf (Buf, sizeof (Buf), "%s%+ld", LocalLabelName (Label), Offs);
+            } else {
+                xsprintf (Buf, sizeof (Buf), "%s", LocalLabelName (Label));
+            }
             break;
 
         default:
@@ -344,25 +369,7 @@ void g_defcodelabel (unsigned label)
 void g_defdatalabel (unsigned label)
 /* Define a local data label */
 {
-    AddDataLine ("%s:", LocalLabelName (label));
-}
-
-
-
-void g_aliasdatalabel (unsigned label, unsigned baselabel, long offs)
-/* Define label as a local alias for baselabel+offs */
-{
-    /* We need an intermediate buffer here since LocalLabelName uses a
-    ** static buffer which changes with each call.
-    */
-    StrBuf L = AUTO_STRBUF_INITIALIZER;
-    SB_AppendStr (&L, LocalLabelName (label));
-    SB_Terminate (&L);
-    AddDataLine ("%s\t:=\t%s+%ld",
-                 SB_GetConstBuf (&L),
-                 LocalLabelName (baselabel),
-                 offs);
-    SB_Done (&L);
+    AddDataLine ("%s:", LocalDataLabelName (label));
 }
 
 
@@ -378,6 +385,33 @@ void g_defgloblabel (const char* Name)
 {
     /* Global labels are always data labels */
     AddDataLine ("_%s:", Name);
+}
+
+
+
+void g_defliterallabel (unsigned label)
+/* Define a literal data label */
+{
+    /* Literal labels are always data labels */
+    AddDataLine ("%s:", PooledLiteralLabelName (label));
+}
+
+
+
+void g_aliasliterallabel (unsigned label, unsigned baselabel, long offs)
+/* Define label as an alias for baselabel+offs */
+{
+    /* We need an intermediate buffer here since LocalLabelName uses a
+    ** static buffer which changes with each call.
+    */
+    StrBuf L = AUTO_STRBUF_INITIALIZER;
+    SB_AppendStr (&L, PooledLiteralLabelName (label));
+    SB_Terminate (&L);
+    AddDataLine ("%s\t:=\t%s+%ld",
+                 SB_GetConstBuf (&L),
+                 PooledLiteralLabelName (baselabel),
+                 offs);
+    SB_Done (&L);
 }
 
 
@@ -1322,52 +1356,117 @@ void g_reglong (unsigned Flags)
 
 
 
+static unsigned g_intpromotion (unsigned flags)
+/* Return new flags for integral promotions for types smaller than int. */
+{
+    /* https://port70.net/~nsz/c/c89/c89-draft.html#3.2.1.1
+    ** A char, a short int, or an int bit-field, or their signed or unsigned varieties, or an
+    ** object that has enumeration type, may be used in an expression wherever an int or
+    ** unsigned int may be used. If an int can represent all values of the original type, the value
+    ** is converted to an int; otherwise it is converted to an unsigned int.
+    ** These are called the integral promotions.
+    */
+
+    if ((flags & CF_TYPEMASK) == CF_CHAR) {
+        /* int can represent all unsigned chars, so unsigned char is promoted to int. */
+        flags &= ~CF_TYPEMASK;
+        flags &= ~CF_UNSIGNED;
+        flags |= CF_INT;
+        return flags;
+    } else if ((flags & CF_TYPEMASK) == CF_SHORT) {
+        /* int cannot represent all unsigned shorts, so unsigned short is promoted to
+        ** unsigned int.
+        */
+        flags &= ~CF_TYPEMASK;
+        flags |= CF_INT;
+        return flags;
+    } else {
+        /* Otherwise, the type is not smaller than int, so leave it alone. */
+        return flags;
+    }
+}
+
+
+
 unsigned g_typeadjust (unsigned lhs, unsigned rhs)
 /* Adjust the integer operands before doing a binary operation. lhs is a flags
 ** value, that corresponds to the value on TOS, rhs corresponds to the value
 ** in (e)ax. The return value is the the flags value for the resulting type.
 */
 {
-    unsigned ltype, rtype;
-    unsigned result;
-
     /* Get the type spec from the flags */
-    ltype = lhs & CF_TYPEMASK;
-    rtype = rhs & CF_TYPEMASK;
+    unsigned ltype = lhs & CF_TYPEMASK;
+    unsigned rtype = rhs & CF_TYPEMASK;
 
     /* Check if a conversion is needed */
     if (ltype == CF_LONG && rtype != CF_LONG && (rhs & CF_CONST) == 0) {
         /* We must promote the primary register to long */
         g_reglong (rhs);
-        /* Get the new rhs type */
-        rhs = (rhs & ~CF_TYPEMASK) | CF_LONG;
-        rtype = CF_LONG;
     } else if (ltype != CF_LONG && (lhs & CF_CONST) == 0 && rtype == CF_LONG) {
         /* We must promote the lhs to long */
-        if (lhs & CF_REG) {
+        if (lhs & CF_PRIMARY) {
             g_reglong (lhs);
         } else {
             g_toslong (lhs);
         }
-        /* Get the new rhs type */
-        lhs = (lhs & ~CF_TYPEMASK) | CF_LONG;
-        ltype = CF_LONG;
     }
 
-    /* Determine the result type for the operation:
-    **  - The result is const if both operands are const.
-    **  - The result is unsigned if one of the operands is unsigned.
-    **  - The result is long if one of the operands is long.
-    **  - Otherwise the result is int sized.
+    /* Result is const if both operands are const. */
+    unsigned const_flag = (lhs & CF_CONST) & (rhs & CF_CONST);
+
+    /* https://port70.net/~nsz/c/c89/c89-draft.html#3.2.1.5
+    ** Many binary operators that expect operands of arithmetic type cause conversions and yield
+    ** result types in a similar way. The purpose is to yield a common type, which is also the type
+    ** of the result. This pattern is called the usual arithmetic conversions.
     */
-    result = (lhs & CF_CONST) & (rhs & CF_CONST);
-    result |= (lhs & CF_UNSIGNED) | (rhs & CF_UNSIGNED);
-    if (rtype == CF_LONG || ltype == CF_LONG) {
-        result |= CF_LONG;
-    } else {
-        result |= CF_INT;
+
+    /* Note that this logic is largely duplicated by ArithmeticConvert. */
+
+    /* Apply integral promotions for types char/short. */
+    lhs = g_intpromotion (lhs);
+    rhs = g_intpromotion (rhs);
+    ltype = lhs & CF_TYPEMASK;
+    rtype = rhs & CF_TYPEMASK;
+
+    /* If either operand has type unsigned long int, the other operand is converted to
+    ** unsigned long int.
+    */
+    if ((ltype == CF_LONG && (lhs & CF_UNSIGNED)) ||
+        (rtype == CF_LONG && (rhs & CF_UNSIGNED))) {
+        return const_flag | CF_UNSIGNED | CF_LONG;
     }
-    return result;
+
+    /* Otherwise, if one operand has type long int and the other has type unsigned int,
+    ** if a long int can represent all values of an unsigned int, the operand of type unsigned int
+    ** is converted to long int ; if a long int cannot represent all the values of an unsigned int,
+    ** both operands are converted to unsigned long int.
+    */
+    if ((ltype == CF_LONG && rtype == CF_INT && (rhs & CF_UNSIGNED)) ||
+        (rtype == CF_LONG && ltype == CF_INT && (rhs & CF_UNSIGNED))) {
+        /* long can represent all unsigneds, so we are in the first sub-case. */
+        return const_flag | CF_LONG;
+    }
+
+    /* Otherwise, if either operand has type long int, the other operand is converted to long int.
+    */
+    if (ltype == CF_LONG || rtype == CF_LONG) {
+        return const_flag | CF_LONG;
+    }
+
+    /* Otherwise, if either operand has type unsigned int, the other operand is converted to
+    ** unsigned int.
+    */
+    if ((ltype == CF_INT && (lhs & CF_UNSIGNED)) ||
+        (rtype == CF_INT && (rhs & CF_UNSIGNED))) {
+        return const_flag | CF_UNSIGNED | CF_INT;
+    }
+
+    /* Otherwise, both operands have type int. */
+    CHECK (ltype == CF_INT);
+    CHECK (!(lhs & CF_UNSIGNED));
+    CHECK (rtype == CF_INT);
+    CHECK (!(rhs & CF_UNSIGNED));
+    return const_flag | CF_INT;
 }
 
 
@@ -1425,106 +1524,24 @@ void g_scale (unsigned flags, long val)
 ** pointer points to.
 */
 {
-    int p2;
-
     /* Value may not be zero */
     if (val == 0) {
         Internal ("Data type has no size");
     } else if (val > 0) {
 
-        /* Scale up */
-        if ((p2 = PowerOf2 (val)) > 0 && p2 <= 4) {
-
-            /* Factor is 2, 4, 8 and 16, use special function */
-            switch (flags & CF_TYPEMASK) {
-
-                case CF_CHAR:
-                    if (flags & CF_FORCECHAR) {
-                        while (p2--) {
-                            AddCodeLine ("asl a");
-                        }
-                        break;
-                    }
-                    /* FALLTHROUGH */
-
-                case CF_INT:
-                    if (flags & CF_UNSIGNED) {
-                        AddCodeLine ("jsr shlax%d", p2);
-                    } else {
-                        AddCodeLine ("jsr aslax%d", p2);
-                    }
-                    break;
-
-                case CF_LONG:
-                    if (flags & CF_UNSIGNED) {
-                        AddCodeLine ("jsr shleax%d", p2);
-                    } else {
-                        AddCodeLine ("jsr asleax%d", p2);
-                    }
-                    break;
-
-                default:
-                    typeerror (flags);
-
-            }
-
-        } else if (val != 1) {
-
-            /* Use a multiplication instead */
+        /* Use a multiplication instead */
+        if (val != 1) {
             g_mul (flags | CF_CONST, val);
-
         }
 
     } else {
 
         /* Scale down */
         val = -val;
-        if ((p2 = PowerOf2 (val)) > 0 && p2 <= 4) {
 
-            /* Factor is 2, 4, 8 and 16 use special function */
-            switch (flags & CF_TYPEMASK) {
-
-                case CF_CHAR:
-                    if (flags & CF_FORCECHAR) {
-                        if (flags & CF_UNSIGNED) {
-                            while (p2--) {
-                                AddCodeLine ("lsr a");
-                            }
-                            break;
-                        } else if (p2 <= 2) {
-                            AddCodeLine ("cmp #$80");
-                            AddCodeLine ("ror a");
-                            break;
-                        }
-                    }
-                    /* FALLTHROUGH */
-
-                case CF_INT:
-                    if (flags & CF_UNSIGNED) {
-                        AddCodeLine ("jsr lsrax%d", p2);
-                    } else {
-                        AddCodeLine ("jsr asrax%d", p2);
-                    }
-                    break;
-
-                case CF_LONG:
-                    if (flags & CF_UNSIGNED) {
-                        AddCodeLine ("jsr lsreax%d", p2);
-                    } else {
-                        AddCodeLine ("jsr asreax%d", p2);
-                    }
-                    break;
-
-                default:
-                    typeerror (flags);
-
-            }
-
-        } else if (val != 1) {
-
-            /* Use a division instead */
+        /* Use a division instead */
+        if (val != 1) {
             g_div (flags | CF_CONST, val);
-
         }
     }
 }
@@ -1541,16 +1558,17 @@ void g_addlocal (unsigned flags, int offs)
 /* Add a local variable to ax */
 {
     unsigned L;
+    int NewOff;
 
     /* Correct the offset and check it */
-    offs -= StackPtr;
-    CheckLocalOffs (offs);
+    NewOff = offs - StackPtr;
+    CheckLocalOffs (NewOff);
 
     switch (flags & CF_TYPEMASK) {
 
         case CF_CHAR:
             L = GetLocalLabel();
-            AddCodeLine ("ldy #$%02X", offs & 0xFF);
+            AddCodeLine ("ldy #$%02X", NewOff & 0xFF);
             AddCodeLine ("clc");
             AddCodeLine ("adc (sp),y");
             AddCodeLine ("bcc %s", LocalLabelName (L));
@@ -1559,7 +1577,7 @@ void g_addlocal (unsigned flags, int offs)
             break;
 
         case CF_INT:
-            AddCodeLine ("ldy #$%02X", offs & 0xFF);
+            AddCodeLine ("ldy #$%02X", NewOff & 0xFF);
             AddCodeLine ("clc");
             AddCodeLine ("adc (sp),y");
             AddCodeLine ("pha");
@@ -2177,7 +2195,7 @@ void g_restore (unsigned flags)
 
 
 void g_cmp (unsigned flags, unsigned long val)
-/* Immidiate compare. The primary register will not be changed, Z flag
+/* Immediate compare. The primary register will not be changed, Z flag
 ** will be set.
 */
 {
@@ -2374,7 +2392,7 @@ void g_call (unsigned Flags, const char* Label, unsigned ArgSize)
 void g_callind (unsigned Flags, unsigned ArgSize, int Offs)
 /* Call subroutine indirect */
 {
-    if ((Flags & CF_LOCAL) == 0) {
+    if ((Flags & CF_ADDRMASK) != CF_STACK) {
         /* Address is in a/x */
         if ((Flags & CF_FIXARGC) == 0) {
             /* Pass arg count */
@@ -2425,15 +2443,30 @@ void g_falsejump (unsigned flags attribute ((unused)), unsigned label)
 }
 
 
+
+void g_branch (unsigned Label)
+/* Branch unconditionally to Label if the CPU has the BRA instruction.
+** Otherwise, jump to Label.
+*/
+{
+    if ((CPUIsets[CPU] & CPU_ISET_65SC02) != 0) {
+        AddCodeLine ("bra %s", LocalLabelName (Label));
+    } else {
+        g_jump (Label);
+    }
+}
+
+
+
 void g_lateadjustSP (unsigned label)
 /* Adjust stack based on non-immediate data */
 {
     AddCodeLine ("pha");
-    AddCodeLine ("lda %s", LocalLabelName (label));
+    AddCodeLine ("lda %s", LocalDataLabelName (label));
     AddCodeLine ("clc");
     AddCodeLine ("adc sp");
     AddCodeLine ("sta sp");
-    AddCodeLine ("lda %s+1", LocalLabelName (label));
+    AddCodeLine ("lda %s+1", LocalDataLabelName (label));
     AddCodeLine ("adc sp+1");
     AddCodeLine ("sta sp+1");
     AddCodeLine ("pla");
@@ -2560,13 +2593,26 @@ void g_mul (unsigned flags, unsigned long val)
         "tosmulax", "tosumulax", "tosmuleax", "tosumuleax"
     };
 
-    int p2;
-
     /* Do strength reduction if the value is constant and a power of two */
-    if (flags & CF_CONST && (p2 = PowerOf2 (val)) >= 0) {
-        /* Generate a shift instead */
-        g_asl (flags, p2);
-        return;
+    if (flags & CF_CONST) {
+
+        /* Deal with negative values if it's signed multiplication */
+        int Negation = (flags & CF_UNSIGNED) == 0 && (long)val < 0;
+        int p2 = PowerOf2 (Negation ? 0UL - val : val);
+
+        /* Check if we can use shift instead of multiplication */
+        if (p2 == 0 || (p2 > 0 && IS_Get (&CodeSizeFactor) >= (Negation ? 100 : 0))) {
+            /* Generate a shift instead */
+            g_asl (flags, p2);
+
+            /* Negate the result if val is negative */
+            if (Negation) {
+                g_neg (flags);
+            }
+
+            /* Done */
+            return;
+        }
     }
 
     /* If the right hand side is const, the lhs is not on stack but still
@@ -2668,19 +2714,104 @@ void g_div (unsigned flags, unsigned long val)
     };
 
     /* Do strength reduction if the value is constant and a power of two */
-    int p2;
-    if ((flags & CF_CONST) && (p2 = PowerOf2 (val)) >= 0) {
+    if (flags & CF_CONST) {
+
+        /* Deal with negative values as well as different sizes */
+        int           Negation   = (flags & CF_UNSIGNED) == 0 && (long)val < 0;
+        unsigned long NegatedVal = 0UL - val;
+        int           p2         = PowerOf2 (Negation ? NegatedVal : val);
+
         /* Generate a shift instead */
-        g_asr (flags, p2);
-    } else {
-        /* Generate a division */
-        if (flags & CF_CONST) {
-            /* lhs is not on stack */
-            flags &= ~CF_FORCECHAR;     /* Handle chars as ints */
-            g_push (flags & ~CF_CONST, 0);
+        if ((flags & CF_UNSIGNED) != 0 && p2 > 0) {
+            g_asr (flags, p2);
+            return;
         }
-        oper (flags, val, ops);
+
+        /* Check if we can afford using shift instead of multiplication at the
+        ** cost of code size */
+        if (p2 == 0 || (p2 > 0 && IS_Get (&CodeSizeFactor) >= (Negation ? 200 : 170))) {
+            /* Generate a conditional shift instead */
+            if (p2 > 0) {
+                unsigned int  DoShiftLabel = GetLocalLabel ();
+                unsigned int  EndLabel     = GetLocalLabel ();
+                unsigned long MaskedVal    = Negation ? val : NegatedVal;
+
+                /* GitHub #169 - if abs(expr) < abs(val), the result is always 0.
+                ** First, check whether expr >= 0 and skip to the shift if true.
+                */
+                switch (flags & CF_TYPEMASK) {
+                case CF_CHAR:
+                    if (flags & CF_FORCECHAR) {
+                        MaskedVal &= 0xFF;
+                        AddCodeLine ("cmp #$00");
+                        AddCodeLine ("bpl %s", LocalLabelName (DoShiftLabel));
+                        break;
+                    }
+                    /* FALLTHROUGH */
+
+                case CF_INT:
+                    MaskedVal &= 0xFFFF;
+                    AddCodeLine ("cpx #$00");
+                    AddCodeLine ("bpl %s", LocalLabelName (DoShiftLabel));
+                    break;
+
+                case CF_LONG:
+                    MaskedVal &= 0xFFFFFFFF;
+                    AddCodeLine ("ldy sreg+1");
+                    AddCodeLine ("bpl %s", LocalLabelName (DoShiftLabel));
+                    break;
+
+                default:
+                    typeerror (flags);
+                    break;
+                }
+                /* Second, check whether expr <= -asb(val) and skip to the
+                ** shift if true. The original content of expr has to be saved
+                ** before the checking comparison and restored after that, as
+                ** the content in Primary register will be destroyed.
+                ** The result of the comparison is a boolean. We can store
+                ** it in the Carry flag with a LSR and branch on it later.
+                */
+                g_save (flags);
+                g_le (flags | CF_UNSIGNED, MaskedVal);
+                AddCodeLine ("lsr a");
+                g_restore (flags);
+                AddCodeLine ("bcs %s", LocalLabelName (DoShiftLabel));
+
+                /* The result is 0. We can just load 0 and skip the shifting. */
+                g_getimmed (flags | CF_ABSOLUTE, 0, 0);
+
+                /* TODO: replace with BEQ? Would it be optimized? */
+                g_jump (EndLabel);
+
+                /* Do the shift. The sign of the result may need to be corrected
+                ** later.
+                */
+                g_defcodelabel (DoShiftLabel);
+                g_asr (flags, p2);
+                g_defcodelabel (EndLabel);
+            }
+
+            /* Negate the result as long as val < 0, even if val == -1 and no
+            ** shift was generated. */
+            if (Negation) {
+                g_neg (flags);
+            }
+
+            /* Done */
+            return;
+        }
+
+        /* If we go here, we didn't emit code. Push the lhs on stack and fall
+        ** into the normal, non-optimized stuff.
+        */
+        flags &= ~CF_FORCECHAR; /* Handle chars as ints */
+        g_push (flags & ~CF_CONST, 0);
     }
+
+    /* Generate a division */
+    oper (flags, val, ops);
+
 }
 
 
@@ -2955,6 +3086,22 @@ void g_asr (unsigned flags, unsigned long val)
         switch (flags & CF_TYPEMASK) {
 
             case CF_CHAR:
+                if (flags & CF_FORCECHAR) {
+                    if ((flags & CF_UNSIGNED) != 0 && val <= 4) {
+                        while (val--) {
+                            AddCodeLine ("lsr a");
+                        }
+                        return;
+                    } else if (val <= 2) {
+                        while (val--) {
+                            AddCodeLine ("cmp #$80");
+                            AddCodeLine ("ror a");
+                        }
+                        return;
+                    }
+                }
+                /* FALLTHROUGH */
+
             case CF_INT:
                 val &= 0x0F;
                 if (val >= 8) {
@@ -3078,7 +3225,6 @@ void g_asl (unsigned flags, unsigned long val)
         "tosaslax", "tosshlax", "tosasleax", "tosshleax"
     };
 
-
     /* If the right hand side is const, the lhs is not on stack but still
     ** in the primary register.
     */
@@ -3087,6 +3233,14 @@ void g_asl (unsigned flags, unsigned long val)
         switch (flags & CF_TYPEMASK) {
 
             case CF_CHAR:
+                if ((flags & CF_FORCECHAR) != 0 && val <= 4) {
+                    while (val--) {
+                        AddCodeLine ("asl a");
+                    }
+                    return;
+                }
+                /* FALLTHROUGH */
+
             case CF_INT:
                 val &= 0x0F;
                 if (val >= 8) {
@@ -3579,7 +3733,7 @@ void g_lt (unsigned flags, unsigned long val)
 
             /* Give a warning in some special cases */
             if (val == 0) {
-                Warning ("Condition is never true");
+                Warning ("Comparison of unsigned type < 0 is always false");
                 AddCodeLine ("jsr return0");
                 return;
             }
@@ -4291,6 +4445,123 @@ void g_initstatic (unsigned InitLabel, unsigned VarLabel, unsigned Size)
         AddCodeLine ("jsr pushax");
         g_getimmed (CF_INT | CF_UNSIGNED | CF_CONST, Size, 0);
         AddCodeLine ("jsr %s", GetLabelName (CF_EXTERNAL, (uintptr_t) "memcpy", 0));
+    }
+}
+
+
+
+/*****************************************************************************/
+/*                                Bit-fields                                 */
+/*****************************************************************************/
+
+
+
+void g_testbitfield (unsigned Flags, unsigned BitOffs, unsigned BitWidth)
+/* Test bit-field in ax. */
+{
+    unsigned EndBit = BitOffs + BitWidth;
+
+    /* If we need to do a test, then we avoid shifting (ASR only shifts one bit at a time,
+    ** so is slow) and just AND with the appropriate mask, then test the result of that.
+    */
+
+    /* Avoid overly large shift on host platform. */
+    if (EndBit == sizeof (unsigned long) * CHAR_BIT) {
+        g_and (Flags | CF_CONST, (~0UL << BitOffs));
+    } else {
+        g_and (Flags | CF_CONST, ((1UL << EndBit) - 1) & (~0UL << BitOffs));
+    }
+
+    /* TODO: When long bit-fields are supported, an optimization to test only 3 bytes when
+    ** EndBit <= 24 is possible.
+    */
+    g_test (Flags | CF_CONST);
+}
+
+
+
+void g_extractbitfield (unsigned Flags, unsigned FullWidthFlags, int IsSigned,
+                        unsigned BitOffs, unsigned BitWidth)
+/* Extract bits from bit-field in ax. */
+{
+    unsigned EndBit = BitOffs + BitWidth;
+
+    /* Shift right by the bit offset; no code is emitted if BitOffs is zero */
+    g_asr (Flags | CF_CONST, BitOffs);
+
+    /* Since we have now shifted down, we could do char ops when the width fits in a char, but we
+    ** also need to clear (or set) the high byte since we've been using CF_FORCECHAR up to now.
+    */
+    unsigned Mask = (1U << BitWidth) - 1;
+
+    /* To zero-extend, we will and by the width if the field doesn't end on a char or
+    ** int boundary.  If it does end on a boundary, then zeros will have already been shifted in,
+    ** but we need to clear the high byte for char.  g_and emits no code if the mask is all ones.
+    ** This is here so the signed and unsigned branches can use it.
+    */
+    unsigned ZeroExtendMask = 0;  /* Zero if we don't need to zero-extend. */
+    if (EndBit == CHAR_BITS) {
+        /* We need to clear the high byte, since CF_FORCECHAR was set. */
+        ZeroExtendMask = 0xFF;
+    } else if (EndBit != INT_BITS) {
+        ZeroExtendMask = (1U << BitWidth) - 1;
+    }
+
+    /* Handle signed bit-fields. */
+    if (IsSigned) {
+        /* Push A, since the sign bit test will destroy it. */
+        AddCodeLine ("pha");
+
+        /* Check sign bit */
+        unsigned SignBitPos = BitWidth - 1U;
+        unsigned SignBitByte = SignBitPos / CHAR_BITS;
+        unsigned SignBitPosInByte = SignBitPos % CHAR_BITS;
+        unsigned SignBitMask = 1U << SignBitPosInByte;
+
+        /* Move the correct byte to A.  This can only be X for now,
+        ** but more cases will be needed to support long.
+        */
+        switch (SignBitByte) {
+          case 0:
+            break;
+          case 1:
+            AddCodeLine ("txa");
+            break;
+          default:
+            FAIL ("Invalid Byte for sign bit");
+        }
+
+        /* Test the sign bit */
+        AddCodeLine ("and #$%02X", SignBitMask);
+        unsigned ZeroExtendLabel = GetLocalLabel ();
+        AddCodeLine ("beq %s", LocalLabelName (ZeroExtendLabel));
+
+        /* Pop A back and sign-extend if required; operating on the full result needs
+        ** to sign-extend into high byte, too.
+        */
+        AddCodeLine ("pla");
+        g_or (FullWidthFlags | CF_CONST, ~Mask);
+
+        unsigned DoneLabel = GetLocalLabel ();
+        g_branch (DoneLabel);
+
+        /* Pop A back, then zero-extend. We need to duplicate the PLA, rather than move it before
+        ** the branch to share with the other label, because PLA changes some condition codes.
+        */
+        g_defcodelabel (ZeroExtendLabel);
+        AddCodeLine ("pla");
+
+        /* Zero the upper bits, the same as the unsigned path. */
+        if (ZeroExtendMask != 0) {
+            g_and (FullWidthFlags | CF_CONST, ZeroExtendMask);
+        }
+
+        g_defcodelabel (DoneLabel);
+    } else {
+        /* Unsigned bit-field, needs only zero-extension. */
+        if (ZeroExtendMask != 0) {
+            g_and (FullWidthFlags | CF_CONST, ZeroExtendMask);
+        }
     }
 }
 

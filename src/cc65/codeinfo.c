@@ -64,6 +64,13 @@ static const char CmpSuffixTab [][4] = {
     "eq", "ne", "gt", "ge", "lt", "le", "ugt", "uge", "ult", "ule"
 };
 
+/* Table with the bool transformers */
+static const char BoolTransformerTab [][8] = {
+    "booleq", "boolne",
+    "boolgt", "boolge", "boollt", "boolle",
+    "boolugt", "booluge", "boolult", "boolule"
+};
+
 /* Table listing the function names and code info values for known internally
 ** used functions. This table should get auto-generated in the future.
 */
@@ -100,9 +107,12 @@ static const FuncInfo FuncInfoTable[] = {
     { "asreax2",        REG_EAX,              REG_EAX | REG_TMP1             },
     { "asreax3",        REG_EAX,              REG_EAX | REG_TMP1             },
     { "asreax4",        REG_EAX,              REG_EAXY | REG_TMP1            },
+    { "bcasta",         REG_A,                REG_AX                         },
+    { "bcastax",        REG_AX,               REG_AX                         },
+    { "bcasteax",       REG_EAX,              REG_EAX | REG_TMP1             },
     { "bnega",          REG_A,                REG_AX                         },
     { "bnegax",         REG_AX,               REG_AX                         },
-    { "bnegeax",        REG_EAX,              REG_EAX                        },
+    { "bnegeax",        REG_EAX,              REG_EAX | REG_TMP1             },
     { "booleq",         REG_NONE,             REG_AX                         },
     { "boolge",         REG_NONE,             REG_AX                         },
     { "boolgt",         REG_NONE,             REG_AX                         },
@@ -375,7 +385,7 @@ static int CompareFuncInfo (const void* Key, const void* Info)
 
 
 
-void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
+fncls_t GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
 /* For the given function, lookup register information and store it into
 ** the given variables. If the function is unknown, assume it will use and
 ** load all registers.
@@ -392,7 +402,7 @@ void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
 
         /* Did we find it in the top-level table? */
         if (E && IsTypeFunc (E->Type)) {
-            FuncDesc* D = E->V.F.Func;
+            FuncDesc* D = GetFuncDesc (E->Type);
 
             /* A variadic function will use the Y register (the parameter list
             ** size is passed there). A fastcall function will use the A or A/X
@@ -410,8 +420,10 @@ void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
                        (AutoCDecl ?
                         IsQualFastcall (E->Type) :
                         !IsQualCDecl (E->Type))) {
-                /* Will use registers depending on the last param. */
-                switch (CheckedSizeOf (D->LastParam->Type)) {
+                /* Will use registers depending on the last param. If the last
+                ** param has incomplete type, just assume __EAX__.
+                */
+                switch (SizeOf (D->LastParam->Type)) {
                     case 1u:
                         *Use = REG_A;
                         break;
@@ -430,7 +442,7 @@ void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
             *Chg = REG_ALL;
 
             /* Done */
-            return;
+            return FNCLS_GLOBAL;
         }
 
     } else if (IsDigit (Name[0]) || Name[0] == '$') {
@@ -441,7 +453,7 @@ void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
         */
         *Use = REG_ALL;
         *Chg = REG_ALL;
-        return;
+        return FNCLS_NUMERIC;
 
     } else {
 
@@ -466,7 +478,7 @@ void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
             *Use = REG_ALL;
             *Chg = REG_ALL;
         }
-        return;
+        return FNCLS_BUILTIN;
     }
 
     /* Function not found - assume that the primary register is input, and all
@@ -474,6 +486,8 @@ void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg)
     */
     *Use = REG_EAXY;
     *Chg = REG_ALL;
+
+    return FNCLS_UNKNOWN;
 }
 
 
@@ -834,5 +848,114 @@ cmp_t FindTosCmpCond (const char* Name)
     } else {
         /* Not found */
         return CMP_INV;
+    }
+}
+
+
+
+const char* GetCmpSuffix (cmp_t Cond)
+/* Return the compare suffix by the given a compare condition or 0 on failure */
+{
+    /* Check for the correct subroutine name */
+    if (Cond >= 0       &&
+        Cond != CMP_INV &&
+        (unsigned)Cond < sizeof (CmpSuffixTab) / sizeof (CmpSuffixTab[0])) {
+        return CmpSuffixTab[Cond];
+    } else {
+        /* Not found */
+        return 0;
+    }
+}
+
+
+
+char* GetBoolCmpSuffix (char* Buf, cmp_t Cond)
+/* Search for a boolean transformer subroutine (eg. booleq) by the given compare
+** condition.
+** Return the output buffer filled with the name of the correct subroutine or 0
+** on failure.
+*/
+{
+    /* Check for the correct boolean transformer subroutine name */
+    const char* Suf = GetCmpSuffix (Cond);
+
+    if (Suf != 0) {
+        sprintf (Buf, "bool%s", Suf);
+        return Buf;
+    } else {
+        /* Not found */
+        return 0;
+    }
+}
+
+
+
+char* GetTosCmpSuffix (char* Buf, cmp_t Cond)
+/* Search for a TOS compare function (eg. tosgtax) by the given compare condition.
+** Return the output buffer filled with the name of the correct function or 0 on
+** failure.
+*/
+{
+    /* Check for the correct TOS function name */
+    const char* Suf = GetCmpSuffix (Cond);
+
+    if (Suf != 0) {
+        sprintf (Buf, "tos%sax", Suf);
+        return Buf;
+    } else {
+        /* Not found */
+        return 0;
+    }
+}
+
+
+
+const char* GetBoolTransformer (cmp_t Cond)
+/* Get the bool transformer corresponding to the given compare condition */
+{
+    if (Cond > CMP_INV && Cond < CMP_END) {
+        return BoolTransformerTab[Cond];
+    }
+
+    /* Not found */
+    return 0;
+}
+
+
+cmp_t GetNegatedCond (cmp_t Cond)
+/* Get the logically opposite compare condition */
+{
+    switch (Cond) {
+    case CMP_EQ: return CMP_NE;
+    case CMP_NE: return CMP_EQ;
+    case CMP_GT: return CMP_LE;
+    case CMP_GE: return CMP_LT;
+    case CMP_LT: return CMP_GE;
+    case CMP_LE: return CMP_GT;
+    case CMP_UGT: return CMP_ULE;
+    case CMP_UGE: return CMP_ULT;
+    case CMP_ULT: return CMP_UGE;
+    case CMP_ULE: return CMP_UGT;
+    default: return CMP_INV;
+    }
+}
+
+
+
+cmp_t GetRevertedCond (cmp_t Cond)
+/* Get the compare condition in reverted order of operands */
+{
+    switch (Cond) {
+    case CMP_EQ: return CMP_EQ;
+    case CMP_NE: return CMP_NE;
+    case CMP_GT: return CMP_LT;
+    case CMP_GE: return CMP_LE;
+    case CMP_LT: return CMP_GT;
+    case CMP_LE: return CMP_GE;
+    case CMP_UGT: return CMP_ULT;
+    case CMP_UGE: return CMP_ULE;
+    case CMP_ULT: return CMP_UGT;
+    case CMP_ULE: return CMP_UGE;
+    default: return CMP_INV;
     }
 }

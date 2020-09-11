@@ -55,7 +55,7 @@ typedef enum {
     TC_COMPATIBLE = TC_SIGN_DIFF, /* Compatible types */
     TC_QUAL_DIFF,                 /* Types differ in qualifier of pointer */
     TC_STRICT_COMPATIBLE,         /* Strict compatibility */
-    TC_EQUAL,                     /* Types are equal */
+    TC_EQUAL,                     /* Types are equivalent */
     TC_IDENTICAL                  /* Types are identical */
 } typecmp_t;
 
@@ -70,6 +70,8 @@ typedef enum {
 typecmp_t TypeCmp (const Type* lhs, const Type* rhs);
 /* Compare two types and return the result */
 
+FuncDesc* RefineFuncDesc (Type* OldType, const Type* NewType);
+/* Refine the existing function descriptor with a new one */
 
 
 /* End of typecmp.h */

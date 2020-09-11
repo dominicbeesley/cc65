@@ -360,6 +360,10 @@ void CE_SetArg (CodeEntry* E, const char* Arg)
 
     /* Assign the new one */
     E->Arg = GetArgCopy (Arg);
+
+    /* Update the Use and Chg in E */
+    const OPCDesc* D = GetOPCDesc (E->OPC);
+    SetUseChgInfo (E, D);
 }
 
 
@@ -470,6 +474,11 @@ int CE_UseLoadFlags (CodeEntry* E)
             default:            /* No bool transformer subroutine */
                 return 0;
         }
+    }
+
+    /* PHP will use all flags */
+    if (E->OPC == OP65_PHP) {
+        return 1;
     }
 
     /* Anything else */
@@ -842,7 +851,9 @@ void CE_GenRegInfo (CodeEntry* E, RegContents* InputRegs)
                 if ((In->RegA & 0x0F) >= 8) {
                     Out->RegA = 0;
                 }
-            } else if (FindBoolCmpCond (E->Arg) != CMP_INV ||
+            } else if (strcmp (E->Arg, "bcastax") == 0     ||
+                       strcmp (E->Arg, "bnegax") == 0      ||
+                       FindBoolCmpCond (E->Arg) != CMP_INV ||
                        FindTosCmpCond (E->Arg) != CMP_INV) {
                 /* Result is boolean value, so X is zero on output */
                 Out->RegX = 0;

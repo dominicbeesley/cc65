@@ -83,14 +83,16 @@ static unsigned GlobalModeFlags (const ExprDesc* Expr)
 /* Return the addressing mode flags for the given expression */
 {
     switch (ED_GetLoc (Expr)) {
+        case E_LOC_NONE:        return CF_IMM;
         case E_LOC_ABS:         return CF_ABSOLUTE;
         case E_LOC_GLOBAL:      return CF_EXTERNAL;
         case E_LOC_STATIC:      return CF_STATIC;
         case E_LOC_REGISTER:    return CF_REGVAR;
-        case E_LOC_STACK:       return CF_NONE;
-        case E_LOC_PRIMARY:     return CF_NONE;
-        case E_LOC_EXPR:        return CF_NONE;
-        case E_LOC_LITERAL:     return CF_STATIC;       /* Same as static */
+        case E_LOC_STACK:       return CF_STACK;
+        case E_LOC_PRIMARY:     return CF_PRIMARY;
+        case E_LOC_EXPR:        return CF_EXPR;
+        case E_LOC_LITERAL:     return CF_LITERAL;
+        case E_LOC_CODE:        return CF_CODE;
         default:
             Internal ("GlobalModeFlags: Invalid location flags value: 0x%04X", Expr->Flags);
             /* NOTREACHED */
@@ -139,27 +141,61 @@ void MarkedExprWithCheck (void (*Func) (ExprDesc*), ExprDesc* Expr)
 
 
 
-static Type* promoteint (Type* lhst, Type* rhst)
-/* In an expression with two ints, return the type of the result */
+static Type* ArithmeticConvert (Type* lhst, Type* rhst)
+/* Perform the usual arithmetic conversions for binary operators. */
 {
-    /* Rules for integer types:
-    **   - If one of the values is a long, the result is long.
-    **   - If one of the values is unsigned, the result is also unsigned.
-    **   - Otherwise the result is an int.
+    /* https://port70.net/~nsz/c/c89/c89-draft.html#3.2.1.5
+    ** Many binary operators that expect operands of arithmetic type cause conversions and yield
+    ** result types in a similar way. The purpose is to yield a common type, which is also the type
+    ** of the result. This pattern is called the usual arithmetic conversions.
+    */
+
+    /* There are additional rules for floating point types that we don't bother with, since
+    ** floating point types are not (yet) supported.
+    ** The integral promotions are performed on both operands.
+    */
+    lhst = IntPromotion (lhst);
+    rhst = IntPromotion (rhst);
+
+    /* If either operand has type unsigned long int, the other operand is converted to
+    ** unsigned long int.
+    */
+    if ((IsTypeLong (lhst) && IsSignUnsigned (lhst)) ||
+        (IsTypeLong (rhst) && IsSignUnsigned (rhst))) {
+        return type_ulong;
+    }
+
+    /* Otherwise, if one operand has type long int and the other has type unsigned int,
+    ** if a long int can represent all values of an unsigned int, the operand of type unsigned int
+    ** is converted to long int ; if a long int cannot represent all the values of an unsigned int,
+    ** both operands are converted to unsigned long int.
+    */
+    if ((IsTypeLong (lhst) && IsTypeInt (rhst) && IsSignUnsigned (rhst)) ||
+        (IsTypeLong (rhst) && IsTypeInt (lhst) && IsSignUnsigned (lhst))) {
+        /* long can represent all unsigneds, so we are in the first sub-case. */
+        return type_long;
+    }
+
+    /* Otherwise, if either operand has type long int, the other operand is converted to long int.
     */
     if (IsTypeLong (lhst) || IsTypeLong (rhst)) {
-        if (IsSignUnsigned (lhst) || IsSignUnsigned (rhst)) {
-            return type_ulong;
-        } else {
-            return type_long;
-        }
-    } else {
-        if (IsSignUnsigned (lhst) || IsSignUnsigned (rhst)) {
-            return type_uint;
-        } else {
-            return type_int;
-        }
+        return type_long;
     }
+
+    /* Otherwise, if either operand has type unsigned int, the other operand is converted to
+    ** unsigned int.
+    */
+    if ((IsTypeInt (lhst) && IsSignUnsigned (lhst)) ||
+        (IsTypeInt (rhst) && IsSignUnsigned (rhst))) {
+        return type_uint;
+    }
+
+    /* Otherwise, both operands have type int. */
+    CHECK (IsTypeInt (lhst));
+    CHECK (IsSignSigned (lhst));
+    CHECK (IsTypeInt (rhst));
+    CHECK (IsSignSigned (rhst));
+    return type_int;
 }
 
 
@@ -183,21 +219,21 @@ static unsigned typeadjust (ExprDesc* lhs, ExprDesc* rhs, int NoPush)
 
     /* Generate type adjustment code if needed */
     ltype = TypeOf (lhst);
-    if (ED_IsLocAbs (lhs)) {
+    if (ED_IsLocNone (lhs)) {
         ltype |= CF_CONST;
     }
     if (NoPush) {
         /* Value is in primary register*/
-        ltype |= CF_REG;
+        ltype |= CF_PRIMARY;
     }
     rtype = TypeOf (rhst);
-    if (ED_IsLocAbs (rhs)) {
+    if (ED_IsLocNone (rhs)) {
         rtype |= CF_CONST;
     }
     flags = g_typeadjust (ltype, rtype);
 
     /* Set the type of the result */
-    lhs->Type = promoteint (lhst, rhst);
+    lhs->Type = ArithmeticConvert (lhst, rhst);
 
     /* Return the code generator flags */
     return flags;
@@ -243,6 +279,23 @@ static int TypeSpecAhead (void)
 
 
 
+static unsigned ExprCheckedSizeOf (const Type* T)
+/* Specially checked SizeOf() used in 'sizeof' expressions */
+{
+    unsigned Size = SizeOf (T);
+    SymEntry* Sym;
+
+    if (Size == 0) {
+        Sym = GetSymType (T);
+        if (Sym == 0 || !SymIsDef (Sym)) {
+            Error ("Cannot apply 'sizeof' to incomplete type '%s'", GetFullTypeName (T));
+        }
+    }
+    return Size;
+}
+
+
+
 void PushAddr (const ExprDesc* Expr)
 /* If the expression contains an address that was somehow evaluated,
 ** push this address on the stack. This is a helper function for all
@@ -259,13 +312,15 @@ void PushAddr (const ExprDesc* Expr)
 
 
 
-static void WarnConstCompareResult (void)
+static void WarnConstCompareResult (const ExprDesc* Expr)
 /* If the result of a comparison is constant, this is suspicious when not in
 ** preprocessor mode.
 */
 {
-    if (!Preprocessing && IS_Get (&WarnConstComparison) != 0) {
-        Warning ("Result of comparison is constant");
+    if (!Preprocessing          &&
+        !ED_NeedsConst (Expr)   &&
+        IS_Get (&WarnConstComparison) != 0) {
+        Warning ("Result of comparison is always %s", Expr->IVal != 0 ? "true" : "false");
     }
 }
 
@@ -277,45 +332,46 @@ static void WarnConstCompareResult (void)
 
 
 
-static unsigned FunctionParamList (FuncDesc* Func, int IsFastcall)
-/* Parse a function parameter list, and pass the parameters to the called
+static unsigned FunctionParamList (FuncDesc* Func, int IsFastcall, ExprDesc* ED)
+/* Parse a function parameter list, and pass the arguments to the called
 ** function. Depending on several criteria, this may be done by just pushing
-** each parameter separately, or creating the parameter frame once, and then
-** storing into this frame.
-** The function returns the size of the parameters pushed.
+** into each parameter separately, or creating the parameter frame once, and
+** then storing into this frame.
+** The function returns the size of the arguments pushed in bytes.
 */
 {
-    ExprDesc Expr;
-
     /* Initialize variables */
     SymEntry* Param       = 0;  /* Keep gcc silent */
-    unsigned  ParamSize   = 0;  /* Size of parameters pushed */
-    unsigned  ParamCount  = 0;  /* Number of parameters pushed */
+    unsigned  PushedSize  = 0;  /* Size of arguments pushed */
+    unsigned  PushedCount = 0;  /* Number of arguments pushed */
     unsigned  FrameSize   = 0;  /* Size of parameter frame */
-    unsigned  FrameParams = 0;  /* Number of params in frame */
+    unsigned  FrameParams = 0;  /* Number of parameters in frame */
     int       FrameOffs   = 0;  /* Offset into parameter frame */
     int       Ellipsis    = 0;  /* Function is variadic */
 
+    /* Make sure the size of all parameters are known */
+    int ParamComplete = F_CheckParamList (Func, 1);
+
     /* As an optimization, we may allocate the complete parameter frame at
-    ** once instead of pushing each parameter as it comes. We may do that,
+    ** once instead of pushing into each parameter as it comes. We may do that,
     ** if...
     **
     **  - optimizations that increase code size are enabled (allocating the
     **    stack frame at once gives usually larger code).
-    **  - we have more than one parameter to push (don't count the last param
-    **    for __fastcall__ functions).
+    **  - we have more than one parameter to push into (don't count the last
+    **    parameter for __fastcall__ functions).
     **
     ** The FrameSize variable will contain a value > 0 if storing into a frame
     ** (instead of pushing) is enabled.
     **
     */
-    if (IS_Get (&CodeSizeFactor) >= 200) {
+    if (ParamComplete && IS_Get (&CodeSizeFactor) >= 200) {
 
         /* Calculate the number and size of the parameters */
         FrameParams = Func->ParamCount;
         FrameSize   = Func->ParamSize;
         if (FrameParams > 0 && IsFastcall) {
-            /* Last parameter is not pushed */
+            /* Last parameter is not pushed into */
             FrameSize -= CheckedSizeOf (Func->LastParam->Type);
             --FrameParams;
         }
@@ -332,25 +388,28 @@ static unsigned FunctionParamList (FuncDesc* Func, int IsFastcall)
         }
     }
 
-    /* Parse the actual parameter list */
+    /* Parse the actual argument list */
     while (CurTok.Tok != TOK_RPAREN) {
 
-        unsigned Flags;
+        unsigned Flags;     /* Code generator flags, not expression flags */
+        ExprDesc Expr;
+        ED_Init (&Expr);
+        Expr.Flags |= ED->Flags & E_MASK_KEEP_SUBEXPR;
 
         /* Count arguments */
-        ++ParamCount;
+        ++PushedCount;
 
         /* Fetch the pointer to the next argument, check for too many args */
-        if (ParamCount <= Func->ParamCount) {
+        if (PushedCount <= Func->ParamCount) {
             /* Beware: If there are parameters with identical names, they
             ** cannot go into the same symbol table, which means that, in this
             ** case of errorneous input, the number of nodes in the symbol
-            ** table and ParamCount are NOT equal. We have to handle this case
+            ** table and PushedCount are NOT equal. We have to handle this case
             ** below to avoid segmentation violations. Since we know that this
             ** problem can only occur if there is more than one parameter,
             ** we will just use the last one.
             */
-            if (ParamCount == 1) {
+            if (PushedCount == 1) {
                 /* First argument */
                 Param = Func->SymTab->SymHead;
             } else if (Param->NextSym != 0) {
@@ -370,62 +429,71 @@ static unsigned FunctionParamList (FuncDesc* Func, int IsFastcall)
             Ellipsis = 1;
         }
 
-        /* Evaluate the parameter expression */
+        /* Evaluate the argument expression */
         hie1 (&Expr);
 
-        /* If we don't have an argument spec., accept anything; otherwise,
-        ** convert the actual argument to the type needed.
-        */
-        Flags = CF_NONE;
-        if (!Ellipsis) {
-
-            /* Convert the argument to the parameter type if needed */
-            TypeConversion (&Expr, Param->Type);
-
-            /* If we have a prototype, chars may be pushed as chars */
-            Flags |= CF_FORCECHAR;
-
-        } else {
-
-            /* No prototype available. Convert array to "pointer to first
-            ** element", and function to "pointer to function".
+        /* Skip to the next parameter if there are any incomplete types */
+        if (ParamComplete) {
+            /* If we don't have an argument spec., accept anything; otherwise,
+            ** convert the actual argument to the type needed.
             */
-            Expr.Type = PtrConversion (Expr.Type);
+            Flags = CF_NONE;
+            if (!Ellipsis) {
 
-        }
+                /* Convert the argument to the parameter type if needed */
+                TypeConversion (&Expr, Param->Type);
 
-        /* Load the value into the primary if it is not already there */
-        LoadExpr (Flags, &Expr);
+                /* If we have a prototype, chars may be pushed as chars */
+                Flags |= CF_FORCECHAR;
 
-        /* Use the type of the argument for the push */
-        Flags |= TypeOf (Expr.Type);
-
-        /* If this is a fastcall function, don't push the last argument */
-        if ((CurTok.Tok == TOK_COMMA && NextTok.Tok != TOK_RPAREN) || !IsFastcall) {
-            unsigned ArgSize = sizeofarg (Flags);
-
-            if (FrameSize > 0) {
-                /* We have the space already allocated, store in the frame.
-                ** Because of invalid type conversions (that have produced an
-                ** error before), we can end up here with a non-aligned stack
-                ** frame. Since no output will be generated anyway, handle
-                ** these cases gracefully instead of doing a CHECK.
-                */
-                if (FrameSize >= ArgSize) {
-                    FrameSize -= ArgSize;
-                } else {
-                    FrameSize = 0;
-                }
-                FrameOffs -= ArgSize;
-                /* Store */
-                g_putlocal (Flags | CF_NOKEEP, FrameOffs, Expr.IVal);
             } else {
-                /* Push the argument */
-                g_push (Flags, Expr.IVal);
+
+                /* No prototype available. Convert array to "pointer to first
+                ** element", and function to "pointer to function".
+                */
+                Expr.Type = PtrConversion (Expr.Type);
+
             }
 
-            /* Calculate total parameter size */
-            ParamSize += ArgSize;
+            /* Handle struct/union specially */
+            if (IsClassStruct (Expr.Type)) {
+                /* Use the replacement type */
+                Flags |= TypeOf (GetStructReplacementType (Expr.Type));
+            } else {
+                /* Use the type of the argument for the push */
+                Flags |= TypeOf (Expr.Type);
+            }
+
+            /* Load the value into the primary if it is not already there */
+            LoadExpr (Flags, &Expr);
+
+            /* If this is a fastcall function, don't push the last argument */
+            if ((CurTok.Tok == TOK_COMMA && NextTok.Tok != TOK_RPAREN) || !IsFastcall) {
+                unsigned ArgSize = sizeofarg (Flags);
+
+                if (FrameSize > 0) {
+                    /* We have the space already allocated, store in the frame.
+                    ** Because of invalid type conversions (that have produced an
+                    ** error before), we can end up here with a non-aligned stack
+                    ** frame. Since no output will be generated anyway, handle
+                    ** these cases gracefully instead of doing a CHECK.
+                    */
+                    if (FrameSize >= ArgSize) {
+                        FrameSize -= ArgSize;
+                    } else {
+                        FrameSize = 0;
+                    }
+                    FrameOffs -= ArgSize;
+                    /* Store */
+                    g_putlocal (Flags | CF_NOKEEP, FrameOffs, Expr.IVal);
+                } else {
+                    /* Push the argument */
+                    g_push (Flags, Expr.IVal);
+                }
+
+                /* Calculate total parameter size */
+                PushedSize += ArgSize;
+            }
         }
 
         /* Check for end of argument list */
@@ -441,20 +509,20 @@ static unsigned FunctionParamList (FuncDesc* Func, int IsFastcall)
         }
     }
 
-    /* Check if we had enough parameters */
-    if (ParamCount < Func->ParamCount) {
+    /* Check if we had enough arguments */
+    if (PushedCount < Func->ParamCount) {
         Error ("Too few arguments in function call");
     }
 
-    /* The function returns the size of all parameters pushed onto the stack.
-    ** However, if there are parameters missing (which is an error, and was
+    /* The function returns the size of all arguments pushed onto the stack.
+    ** However, if there are parameters missed (which is an error, and was
     ** flagged by the compiler), AND a stack frame was preallocated above,
     ** we would loose track of the stackpointer, and generate an internal error
     ** later. So we correct the value by the parameters that should have been
-    ** pushed, to avoid an internal compiler error. Since an error was
+    ** pushed into, to avoid an internal compiler error. Since an error was
     ** generated before, no code will be output anyway.
     */
-    return ParamSize + FrameSize;
+    return PushedSize + FrameSize;
 }
 
 
@@ -469,6 +537,7 @@ static void FunctionCall (ExprDesc* Expr)
     int           PtrOffs = 0;    /* Offset of function pointer on stack */
     int           IsFastcall = 0; /* True if it's a fast-call function */
     int           PtrOnStack = 0; /* True if a pointer copy is on stack */
+    Type*         ReturnType;
 
     /* Skip the left paren */
     NextToken ();
@@ -499,14 +568,14 @@ static void FunctionCall (ExprDesc* Expr)
         ** For fastcall functions we do also need to place a copy of the
         ** pointer on stack, since we cannot use a/x.
         */
-        PtrOnStack = IsFastcall || !ED_IsConst (Expr);
+        PtrOnStack = IsFastcall || !ED_IsConstAddr (Expr);
         if (PtrOnStack) {
 
             /* Not a global or local variable, or a fastcall function. Load
             ** the pointer into the primary and mark it as an expression.
             */
             LoadExpr (CF_NONE, Expr);
-            ED_MakeRValExpr (Expr);
+            ED_FinalizeRValLoad (Expr);
 
             /* Remember the code position */
             GetCodePos (&Mark);
@@ -524,7 +593,7 @@ static void FunctionCall (ExprDesc* Expr)
         }
 
         /* Check for known standard functions and inline them */
-        if (Expr->Name != 0) {
+        if (Expr->Name != 0 && !ED_IsUneval (Expr)) {
             int StdFunc = FindStdFunc ((const char*) Expr->Name);
             if (StdFunc >= 0) {
                 /* Inline this function */
@@ -541,7 +610,7 @@ static void FunctionCall (ExprDesc* Expr)
     }
 
     /* Parse the parameter list */
-    ParamSize = FunctionParamList (Func, IsFastcall);
+    ParamSize = FunctionParamList (Func, IsFastcall, Expr);
 
     /* We need the closing paren here */
     ConsumeRParen ();
@@ -577,7 +646,7 @@ static void FunctionCall (ExprDesc* Expr)
             }
 
             /* Call the function */
-            g_callind (TypeOf (Expr->Type+1), ParamSize, PtrOffs);
+            g_callind (FuncTypeOf (Expr->Type+1), ParamSize, PtrOffs);
 
         } else {
 
@@ -586,7 +655,7 @@ static void FunctionCall (ExprDesc* Expr)
             ** Since fastcall functions may never be variadic, we can use the
             ** index register for this purpose.
             */
-            g_callind (CF_LOCAL, ParamSize, PtrOffs);
+            g_callind (CF_STACK, ParamSize, PtrOffs);
         }
 
         /* If we have a pointer on stack, remove it */
@@ -638,16 +707,28 @@ static void FunctionCall (ExprDesc* Expr)
 
             SB_Done (&S);
 
-            g_call (TypeOf (Expr->Type), Func->WrappedCall->Name, ParamSize);
+            g_call (FuncTypeOf (Expr->Type), Func->WrappedCall->Name, ParamSize);
         } else {
-            g_call (TypeOf (Expr->Type), (const char*) Expr->Name, ParamSize);
+            g_call (FuncTypeOf (Expr->Type), (const char*) Expr->Name, ParamSize);
         }
 
     }
 
     /* The function result is an rvalue in the primary register */
-    ED_MakeRValExpr (Expr);
-    Expr->Type = GetFuncReturn (Expr->Type);
+    ED_FinalizeRValLoad (Expr);
+    ReturnType = GetFuncReturn (Expr->Type);
+
+    /* Handle struct/union specially */
+    if (IsClassStruct (ReturnType)) {
+        /* If there is no replacement type, then it is just the address */
+        if (ReturnType == GetStructReplacementType (ReturnType)) {
+            /* Dereference it */
+            ED_IndExpr (Expr);
+            ED_MarkExprAsRVal (Expr);
+        }
+    }
+
+    Expr->Type = ReturnType;
 }
 
 
@@ -657,23 +738,20 @@ static void Primary (ExprDesc* E)
 {
     SymEntry* Sym;
 
-    /* Initialize fields in the expression stucture */
-    ED_Init (E);
-
     /* Character and integer constants. */
     if (CurTok.Tok == TOK_ICONST || CurTok.Tok == TOK_CCONST) {
-        E->IVal  = CurTok.IVal;
-        E->Flags = E_LOC_ABS | E_RTYPE_RVAL;
-        E->Type  = CurTok.Type;
+        E->IVal   = CurTok.IVal;
+        E->Flags |= E_LOC_NONE | E_RTYPE_RVAL;
+        E->Type   = CurTok.Type;
         NextToken ();
         return;
     }
 
     /* Floating point constant */
     if (CurTok.Tok == TOK_FCONST) {
-        E->FVal  = CurTok.FVal;
-        E->Flags = E_LOC_ABS | E_RTYPE_RVAL;
-        E->Type  = CurTok.Type;
+        E->FVal   = CurTok.FVal;
+        E->Flags |= E_LOC_NONE | E_RTYPE_RVAL;
+        E->Type   = CurTok.Type;
         NextToken ();
         return;
     }
@@ -707,6 +785,8 @@ static void Primary (ExprDesc* E)
         return;
     }
 
+    unsigned Flags = E->Flags & E_MASK_KEEP_MAKE;
+
     switch (CurTok.Tok) {
 
         case TOK_BOOL_AND:
@@ -716,7 +796,7 @@ static void Primary (ExprDesc* E)
                 NextToken ();
                 Entry = AddLabelSym (CurTok.Ident, SC_REF | SC_GOTO_IND);
                 /* output its label */
-                E->Flags = E_RTYPE_RVAL | E_LOC_STATIC;
+                E->Flags = E_RTYPE_RVAL | E_LOC_CODE | E_ADDRESS_OF;
                 E->Name = Entry->V.L.Label;
                 E->Type = PointerTo (type_void);
                 NextToken ();
@@ -738,12 +818,12 @@ static void Primary (ExprDesc* E)
 
                 /* Check for illegal symbol types */
                 CHECK ((Sym->Flags & SC_LABEL) != SC_LABEL);
-                if (Sym->Flags & SC_TYPE) {
+                if (Sym->Flags & SC_ESUTYPEMASK) {
                     /* Cannot use type symbols */
                     Error ("Variable identifier expected");
                     /* Assume an int type to make E valid */
-                    E->Flags = E_LOC_STACK | E_RTYPE_LVAL;
-                    E->Type  = type_int;
+                    E->Flags |= E_LOC_STACK | E_RTYPE_LVAL;
+                    E->Type   = type_int;
                     return;
                 }
 
@@ -756,7 +836,7 @@ static void Primary (ExprDesc* E)
                 /* Check for legal symbol types */
                 if ((Sym->Flags & SC_CONST) == SC_CONST) {
                     /* Enum or some other numeric constant */
-                    E->Flags = E_LOC_ABS | E_RTYPE_RVAL;
+                    E->Flags = E_LOC_NONE | E_RTYPE_RVAL;
                     E->IVal = Sym->V.ConstVal;
                 } else if ((Sym->Flags & SC_FUNC) == SC_FUNC) {
                     /* Function */
@@ -782,7 +862,7 @@ static void Primary (ExprDesc* E)
                     E->Name  = Sym->V.R.RegOffs;
                 } else if ((Sym->Flags & SC_STATIC) == SC_STATIC) {
                     /* Static variable */
-                    if (Sym->Flags & (SC_EXTERN | SC_STORAGE)) {
+                    if (Sym->Flags & (SC_EXTERN | SC_STORAGE | SC_DECL)) {
                         E->Flags = E_LOC_GLOBAL | E_RTYPE_LVAL;
                         E->Name = (uintptr_t) Sym->Name;
                     } else {
@@ -797,12 +877,12 @@ static void Primary (ExprDesc* E)
 
                 /* We've made all variables lvalues above. However, this is
                 ** not always correct: An array is actually the address of its
-                ** first element, which is a rvalue, and a function is a
+                ** first element, which is an rvalue, and a function is an
                 ** rvalue, too, because we cannot store anything in a function.
                 ** So fix the flags depending on the type.
                 */
                 if (IsTypeArray (E->Type) || IsTypeFunc (E->Type)) {
-                    ED_MakeRVal (E);
+                    ED_AddrExpr (E);
                 }
 
             } else {
@@ -843,9 +923,13 @@ static void Primary (ExprDesc* E)
         case TOK_SCONST:
         case TOK_WCSCONST:
             /* String literal */
-            E->LVal  = UseLiteral (CurTok.SVal);
+            if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+                E->LVal = UseLiteral (CurTok.SVal);
+            } else {
+                E->LVal = CurTok.SVal;
+            }
             E->Type  = GetCharArrayType (GetLiteralSize (CurTok.SVal));
-            E->Flags = E_LOC_LITERAL | E_RTYPE_RVAL;
+            E->Flags = E_LOC_LITERAL | E_RTYPE_RVAL | E_ADDRESS_OF;
             E->IVal  = 0;
             E->Name  = GetLiteralLabel (CurTok.SVal);
             NextToken ();
@@ -854,7 +938,7 @@ static void Primary (ExprDesc* E)
         case TOK_ASM:
             /* ASM statement */
             AsmStatement ();
-            E->Flags = E_LOC_EXPR | E_RTYPE_RVAL;
+            E->Flags = E_RTYPE_RVAL | E_EVAL_MAYBE_UNUSED;
             E->Type  = type_void;
             break;
 
@@ -883,11 +967,49 @@ static void Primary (ExprDesc* E)
             /* Illegal primary. Be sure to skip the token to avoid endless
             ** error loops.
             */
-            Error ("Expression expected");
-            NextToken ();
+            if (CurTok.Tok == TOK_LCURLY) {
+                /* Statement block */
+                NextToken ();
+                Error ("Expression expected");
+                hie0 (E);
+                if (CurTok.Tok == TOK_RCURLY) {
+                    NextToken ();
+                }
+                break;
+            } else {
+                /* Let's see if this is a C99-style declaration */
+                DeclSpec    Spec;
+                InitDeclSpec (&Spec);
+                ParseDeclSpec (&Spec, -1, T_QUAL_NONE);
+
+                if (Spec.Type->C != T_END) {
+
+                    Error ("Mixed declarations and code are not supported in cc65");
+                    while (CurTok.Tok != TOK_SEMI) {
+                        Declaration Decl;
+
+                        /* Parse one declaration */
+                        ParseDecl (&Spec, &Decl, DM_ACCEPT_IDENT);
+                        if (CurTok.Tok == TOK_ASSIGN) {
+                            NextToken ();
+                            ParseInit (Decl.Type);
+                        }
+                        if (CurTok.Tok == TOK_COMMA) {
+                            NextToken ();
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    Error ("Expression expected");
+                    NextToken ();
+                }
+            }
             ED_MakeConstAbsInt (E, 1);
             break;
     }
+
+    E->Flags |= Flags;
 }
 
 
@@ -903,6 +1025,8 @@ static void ArrayRef (ExprDesc* Expr)
     Type*       ElementType;
     Type*       tptr1;
 
+    ED_Init (&Subscript);
+    Subscript.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
     /* Skip the bracket */
     NextToken ();
@@ -912,12 +1036,11 @@ static void ArrayRef (ExprDesc* Expr)
 
     /* We can apply a special treatment for arrays that have a const base
     ** address. This is true for most arrays and will produce a lot better
-    ** code. Check if this is a const base address.
+    ** code. Check if this is a "quasi-const base" address.
     */
-    ConstBaseAddr = ED_IsRVal (Expr) &&
-                    (ED_IsLocConst (Expr) || ED_IsLocStack (Expr));
+    ConstBaseAddr = ED_IsRVal (Expr) && ED_IsLocQuasiConst (Expr);
 
-    /* If we have a constant base, we delay the address fetch */
+    /* If we have a quasi-const base address, we delay the address fetch */
     GetCodePos (&Mark1);
     if (!ConstBaseAddr) {
         /* Get a pointer to the array into the primary */
@@ -984,15 +1107,16 @@ static void ArrayRef (ExprDesc* Expr)
     /* If the subscript is a bit-field, load it and make it an rvalue */
     if (ED_IsBitField (&Subscript)) {
         LoadExpr (CF_NONE, &Subscript);
-        ED_MakeRValExpr (&Subscript);
+        ED_FinalizeRValLoad (&Subscript);
     }
 
-    /* Check if the subscript is constant absolute value */
+    /* Make the address of the array element from the base and subscript */
     if (ED_IsConstAbs (&Subscript) && ED_CodeRangeIsEmpty (&Subscript)) {
 
-        /* The array subscript is a numeric constant. If we had pushed the
-        ** array base address onto the stack before, we can remove this value,
-        ** since we can generate expression+offset.
+        /* The array subscript is a constant. Since we can have the element
+        ** address directly as base+offset, we can remove the array address
+        ** push onto the stack before if loading subscript doesn't tamper that
+        ** address in the primary. 
         */
         if (!ConstBaseAddr) {
             RemoveCode (&Mark2);
@@ -1015,28 +1139,23 @@ static void ArrayRef (ExprDesc* Expr)
             ** already in Expr. If the base address was a constant, we can even
             ** remove the code that loaded the address into the primary.
             */
-            if (IsTypeArray (Expr->Type)) {
-
-                /* Adjust the offset */
-                Expr->IVal += Subscript.IVal;
-
-            } else {
-
+            if (!IsTypeArray (Expr->Type)) {
+ 
                 /* It's a pointer, so we do have to load it into the primary
                 ** first (if it's not already there).
                 */
-                if (ConstBaseAddr || ED_IsLVal (Expr)) {
+                if (!ConstBaseAddr && ED_IsLVal (Expr)) {
                     LoadExpr (CF_NONE, Expr);
-                    ED_MakeRValExpr (Expr);
+                    ED_FinalizeRValLoad (Expr);
                 }
-
-                /* Use the offset */
-                Expr->IVal = Subscript.IVal;
             }
+
+            /* Adjust the offset */
+            Expr->IVal += Subscript.IVal;
 
         } else {
 
-            /* Scale the rhs value according to the element type */
+            /* Scale the lhs value according to the element type */
             g_scale (TypeOf (tptr1), CheckedSizeOf (ElementType));
 
             /* Add the subscript. Since arrays are indexed by integers,
@@ -1106,7 +1225,7 @@ static void ArrayRef (ExprDesc* Expr)
             ** subscript was not scaled, that is, if this was a byte array
             ** or pointer.
             */
-            if ((ED_IsLocConst (&Subscript) || ED_IsLocStack (&Subscript)) &&
+            if (ED_IsLocQuasiConst (&Subscript) &&
                 CheckedSizeOf (ElementType) == SIZEOF_CHAR) {
 
                 unsigned Flags;
@@ -1131,12 +1250,13 @@ static void ArrayRef (ExprDesc* Expr)
                 }
             } else {
 
-                if (ED_IsLocAbs (Expr)) {
+                if (ED_IsLocNone (Expr) ||
+                    (ED_IsLocAbs (Expr) && ED_IsAddrExpr (Expr))) {
                     /* Constant numeric address. Just add it */
                     g_inc (CF_INT, Expr->IVal);
                 } else if (ED_IsLocStack (Expr)) {
                     /* Base address is a local variable address */
-                    if (IsTypeArray (Expr->Type)) {
+                    if (ED_IsAddrExpr (Expr)) {
                         g_addaddr_local (CF_INT, Expr->IVal);
                     } else {
                         g_addlocal (CF_PTR, Expr->IVal);
@@ -1144,7 +1264,7 @@ static void ArrayRef (ExprDesc* Expr)
                 } else {
                     /* Base address is a static variable address */
                     unsigned Flags = CF_INT | GlobalModeFlags (Expr);
-                    if (ED_IsRVal (Expr)) {
+                    if (ED_IsAddrExpr (Expr)) {
                         /* Add the address of the location */
                         g_addaddr_static (Flags, Expr->Name, Expr->IVal);
                     } else {
@@ -1153,27 +1273,27 @@ static void ArrayRef (ExprDesc* Expr)
                     }
                 }
             }
-
-
         }
 
-        /* The result is an expression in the primary */
-        ED_MakeRValExpr (Expr);
+        /* The address of the element is an rvalue in the primary */
+        ED_FinalizeRValLoad (Expr);
 
     }
 
-    /* Result is of element type */
+    /* The final result is usually an lvalue expression of element type
+    ** referenced in the primary, unless it is once again an array. We can just
+    ** assume the usual case first, and change it later if necessary.
+    */
+    ED_IndExpr (Expr);
     Expr->Type = ElementType;
 
-    /* An array element is actually a variable. So the rules for variables
-    ** with respect to the reference type apply: If it's an array, it is
-    ** a rvalue, otherwise it's an lvalue. (A function would also be a rvalue,
-    ** but an array cannot contain functions).
+    /* An array element is actually a variable. So the rules for variables with
+    ** respect to the reference type apply: If it's an array, it is virtually
+    ** an rvalue address, otherwise it's an lvalue reference. (A function would
+    ** also be an rvalue address, but an array cannot contain functions).
     */
     if (IsTypeArray (Expr->Type)) {
-        ED_MakeRVal (Expr);
-    } else {
-        ED_MakeLVal (Expr);
+        ED_AddrExpr (Expr);
     }
 
     /* Consume the closing bracket */
@@ -1183,10 +1303,9 @@ static void ArrayRef (ExprDesc* Expr)
 
 
 static void StructRef (ExprDesc* Expr)
-/* Process struct field after . or ->. */
+/* Process struct/union field after . or ->. */
 {
     ident Ident;
-    SymEntry* Field;
     Type* FinalType;
     TypeCode Q;
 
@@ -1199,78 +1318,109 @@ static void StructRef (ExprDesc* Expr)
         return;
     }
 
-    /* Get the symbol table entry and check for a struct field */
+    /* Get the symbol table entry and check for a struct/union field */
     strcpy (Ident, CurTok.Ident);
     NextToken ();
-    Field = FindStructField (Expr->Type, Ident);
-    if (Field == 0) {
-        Error ("Struct/union has no field named '%s'", Ident);
+    const SymEntry Field = FindStructField (Expr->Type, Ident);
+    if (Field.Type == 0) {
+        Error ("No field named '%s' found in '%s'", Ident, GetFullTypeName (Expr->Type));
         /* Make the expression an integer at address zero */
         ED_MakeConstAbs (Expr, 0, type_int);
         return;
     }
 
-    /* If we have a struct pointer that is an lvalue and not already in the
-    ** primary, load it now.
+    /* A struct/union is usually an lvalue. If not, it is a struct/union passed
+    ** in the primary register, which is usually the result returned from a
+    ** function. However, it is possible that this rvalue is the result of
+    ** certain kind of operations on an lvalue such as assignment, and there
+    ** are no reasons to disallow such use cases. So we just rely on the check
+    ** upon function returns to catch the unsupported cases and dereference the
+    ** rvalue address of the struct/union here all the time.
     */
-    if (ED_IsLVal (Expr) && IsTypePtr (Expr->Type)) {
+    if (IsTypePtr (Expr->Type)      ||
+        (ED_IsRVal (Expr)       &&
+         ED_IsLocPrimary (Expr) &&
+         Expr->Type == GetStructReplacementType (Expr->Type))) {
 
-        /* Load into the primary */
+        if (!ED_IsConst (Expr) && !ED_IsLocPrimary (Expr)) {
+            /* If we have a non-const struct/union pointer that is not in the
+            ** primary yet, load its content now.
+            */
+            LoadExpr (CF_NONE, Expr);
+
+            /* Clear the offset */
+            Expr->IVal = 0;
+        }
+
+        /* Dereference the address expression */
+        ED_IndExpr (Expr);
+
+    } else if (!ED_IsLocQuasiConst (Expr) && !ED_IsLocPrimaryOrExpr (Expr)) {
+        /* Load the base address into the primary (and use it as a reference
+        ** later) if it's not quasi-const or in the primary already.
+        */
         LoadExpr (CF_NONE, Expr);
-
-        /* Make it an lvalue expression */
-        ED_MakeLValExpr (Expr);
     }
 
-    /* The type is the type of the field plus any qualifiers from the struct */
+    /* Clear the tested flag set during loading */
+    ED_MarkAsUntested (Expr);
+
+    /* The type is the field type plus any qualifiers from the struct/union */
     if (IsClassStruct (Expr->Type)) {
         Q = GetQualifier (Expr->Type);
     } else {
         Q = GetQualifier (Indirect (Expr->Type));
     }
-    if (GetQualifier (Field->Type) == (GetQualifier (Field->Type) | Q)) {
-        FinalType = Field->Type;
+    if (GetQualifier (Field.Type) == (GetQualifier (Field.Type) | Q)) {
+        FinalType = Field.Type;
     } else {
-        FinalType = TypeDup (Field->Type);
+        FinalType = TypeDup (Field.Type);
         FinalType->C |= Q;
     }
 
-    /* A struct is usually an lvalue. If not, it is a struct in the primary
-    ** register.
-    */
-    if (ED_IsRVal (Expr) && ED_IsLocExpr (Expr) && !IsTypePtr (Expr->Type)) {
+    if (ED_IsRVal (Expr) && ED_IsLocPrimary (Expr) && !IsTypePtr (Expr->Type)) {
 
         unsigned Flags = 0;
         unsigned BitOffs;
 
         /* Get the size of the type */
-        unsigned Size = SizeOf (Expr->Type);
+        unsigned StructSize = SizeOf (Expr->Type);
+        unsigned FieldSize  = SizeOf (Field.Type);
 
         /* Safety check */
-        CHECK (Field->V.Offs + Size <= SIZEOF_LONG);
+        CHECK (Field.V.Offs + FieldSize <= StructSize);
 
-        /* The type of the operation depends on the type of the struct */
-        switch (Size) {
-            case 1:     Flags = CF_CHAR | CF_UNSIGNED | CF_CONST;       break;
-            case 2:     Flags = CF_INT  | CF_UNSIGNED | CF_CONST;       break;
-            case 3:     /* FALLTHROUGH */
-            case 4:     Flags = CF_LONG | CF_UNSIGNED | CF_CONST;       break;
-            default:    Internal ("Invalid struct size: %u", Size);     break;
+        /* The type of the operation depends on the type of the struct/union */
+        switch (StructSize) {
+            case 1:
+                Flags = CF_CHAR | CF_UNSIGNED | CF_CONST;
+                break;
+            case 2:
+                Flags = CF_INT  | CF_UNSIGNED | CF_CONST;
+                break;
+            case 3:
+                /* FALLTHROUGH */
+            case 4:
+                Flags = CF_LONG | CF_UNSIGNED | CF_CONST;
+                break;
+            default:
+                Internal ("Invalid '%s' size: %u", GetFullTypeName (Expr->Type), StructSize);
+                break;
         }
 
         /* Generate a shift to get the field in the proper position in the
         ** primary. For bit fields, mask the value.
         */
-        BitOffs = Field->V.Offs * CHAR_BITS;
-        if (SymIsBitField (Field)) {
-            BitOffs += Field->V.B.BitOffs;
+        BitOffs = Field.V.Offs * CHAR_BITS;
+        if (SymIsBitField (&Field)) {
+            BitOffs += Field.V.B.BitOffs;
             g_asr (Flags, BitOffs);
             /* Mask the value. This is unnecessary if the shift executed above
             ** moved only zeroes into the value.
             */
-            if (BitOffs + Field->V.B.BitWidth != Size * CHAR_BITS) {
+            if (BitOffs + Field.V.B.BitWidth != FieldSize * CHAR_BITS) {
                 g_and (CF_INT | CF_UNSIGNED | CF_CONST,
-                       (0x0001U << Field->V.B.BitWidth) - 1U);
+                       (0x0001U << Field.V.B.BitWidth) - 1U);
             }
         } else {
             g_asr (Flags, BitOffs);
@@ -1281,26 +1431,25 @@ static void StructRef (ExprDesc* Expr)
 
     } else {
 
-        /* Set the struct field offset */
-        Expr->IVal += Field->V.Offs;
+        /* Set the struct/union field offset */
+        Expr->IVal += Field.V.Offs;
 
         /* Use the new type */
         Expr->Type = FinalType;
 
-        /* An struct member is actually a variable. So the rules for variables
-        ** with respect to the reference type apply: If it's an array, it is
-        ** a rvalue, otherwise it's an lvalue. (A function would also be a rvalue,
-        ** but a struct field cannot be a function).
+        /* The usual rules for variables with respect to the reference types
+        ** apply to struct/union fields as well: If a field is an array, it is
+        ** virtually an rvalue address, otherwise it's an lvalue reference. (A
+        ** function would also be an rvalue address, but a struct/union cannot
+        ** contain functions).
         */
         if (IsTypeArray (Expr->Type)) {
-            ED_MakeRVal (Expr);
-        } else {
-            ED_MakeLVal (Expr);
+            ED_AddrExpr (Expr);
         }
 
         /* Make the expression a bit field if necessary */
-        if (SymIsBitField (Field)) {
-            ED_MakeBitField (Expr, Field->V.B.BitOffs, Field->V.B.BitWidth);
+        if (SymIsBitField (&Field)) {
+            ED_MakeBitField (Expr, Field.V.B.BitOffs, Field.V.B.BitWidth);
         }
     }
 
@@ -1346,7 +1495,7 @@ static void hie11 (ExprDesc *Expr)
 
             case TOK_DOT:
                 if (!IsClassStruct (Expr->Type)) {
-                    Error ("Struct expected");
+                    Error ("Struct or union expected");
                 }
                 StructRef (Expr);
                 break;
@@ -1357,7 +1506,7 @@ static void hie11 (ExprDesc *Expr)
                     Expr->Type = ArrayToPtr (Expr->Type);
                 }
                 if (!IsClassPtr (Expr->Type) || !IsClassStruct (Indirect (Expr->Type))) {
-                    Error ("Struct pointer expected");
+                    Error ("Struct pointer or union pointer expected");
                 }
                 StructRef (Expr);
                 break;
@@ -1391,23 +1540,18 @@ void Store (ExprDesc* Expr, const Type* StoreType)
     switch (ED_GetLoc (Expr)) {
 
         case E_LOC_ABS:
-            /* Absolute: numeric address or const */
+            /* Absolute numeric addressed variable */
             g_putstatic (Flags, Expr->IVal, 0);
             break;
 
         case E_LOC_GLOBAL:
-            /* Global variable */
-            g_putstatic (Flags, Expr->Name, Expr->IVal);
-            break;
-
         case E_LOC_STATIC:
-        case E_LOC_LITERAL:
-            /* Static variable or literal in the literal pool */
-            g_putstatic (Flags, Expr->Name, Expr->IVal);
-            break;
-
         case E_LOC_REGISTER:
-            /* Register variable */
+        case E_LOC_LITERAL:
+        case E_LOC_CODE:
+            /* Global variabl, static variable, register variable, pooled
+            ** literal or code label location.
+            */
             g_putstatic (Flags, Expr->Name, Expr->IVal);
             break;
 
@@ -1421,8 +1565,12 @@ void Store (ExprDesc* Expr, const Type* StoreType)
             break;
 
         case E_LOC_EXPR:
-            /* An expression in the primary register */
+            /* An expression referenced in the primary register */
             g_putind (Flags, Expr->IVal);
+            break;
+
+        case E_LOC_NONE:
+            /* We may get here as a result of previous compiler errors */
             break;
 
         default:
@@ -1466,23 +1614,18 @@ static void PreInc (ExprDesc* Expr)
     switch (ED_GetLoc (Expr)) {
 
         case E_LOC_ABS:
-            /* Absolute: numeric address or const */
+            /* Absolute numeric addressed variable */
             g_addeqstatic (Flags, Expr->IVal, 0, Val);
             break;
 
         case E_LOC_GLOBAL:
-            /* Global variable */
-            g_addeqstatic (Flags, Expr->Name, Expr->IVal, Val);
-            break;
-
         case E_LOC_STATIC:
-        case E_LOC_LITERAL:
-            /* Static variable or literal in the literal pool */
-            g_addeqstatic (Flags, Expr->Name, Expr->IVal, Val);
-            break;
-
         case E_LOC_REGISTER:
-            /* Register variable */
+        case E_LOC_LITERAL:
+        case E_LOC_CODE:
+            /* Global variabl, static variable, register variable, pooled
+            ** literal or code label location.
+            */
             g_addeqstatic (Flags, Expr->Name, Expr->IVal, Val);
             break;
 
@@ -1497,7 +1640,7 @@ static void PreInc (ExprDesc* Expr)
             break;
 
         case E_LOC_EXPR:
-            /* An expression in the primary register */
+            /* An expression referenced in the primary register */
             g_addeqind (Flags, Expr->IVal, Val);
             break;
 
@@ -1506,7 +1649,7 @@ static void PreInc (ExprDesc* Expr)
     }
 
     /* Result is an expression, no reference */
-    ED_MakeRValExpr (Expr);
+    ED_FinalizeRValLoad (Expr);
 }
 
 
@@ -1542,23 +1685,18 @@ static void PreDec (ExprDesc* Expr)
     switch (ED_GetLoc (Expr)) {
 
         case E_LOC_ABS:
-            /* Absolute: numeric address or const */
+            /* Absolute numeric addressed variable */
             g_subeqstatic (Flags, Expr->IVal, 0, Val);
             break;
 
         case E_LOC_GLOBAL:
-            /* Global variable */
-            g_subeqstatic (Flags, Expr->Name, Expr->IVal, Val);
-            break;
-
         case E_LOC_STATIC:
-        case E_LOC_LITERAL:
-            /* Static variable or literal in the literal pool */
-            g_subeqstatic (Flags, Expr->Name, Expr->IVal, Val);
-            break;
-
         case E_LOC_REGISTER:
-            /* Register variable */
+        case E_LOC_LITERAL:
+        case E_LOC_CODE:
+            /* Global variabl, static variable, register variable, pooled
+            ** literal or code label location.
+            */
             g_subeqstatic (Flags, Expr->Name, Expr->IVal, Val);
             break;
 
@@ -1569,7 +1707,7 @@ static void PreDec (ExprDesc* Expr)
 
         case E_LOC_PRIMARY:
             /* The primary register */
-            g_inc (Flags, Val);
+            g_dec (Flags, Val);
             break;
 
         case E_LOC_EXPR:
@@ -1582,7 +1720,7 @@ static void PreDec (ExprDesc* Expr)
     }
 
     /* Result is an expression, no reference */
-    ED_MakeRValExpr (Expr);
+    ED_FinalizeRValLoad (Expr);
 }
 
 
@@ -1638,7 +1776,7 @@ static void PostInc (ExprDesc* Expr)
     }
 
     /* The result is always an expression, no reference */
-    ED_MakeRValExpr (Expr);
+    ED_FinalizeRValLoad (Expr);
 }
 
 
@@ -1694,7 +1832,7 @@ static void PostDec (ExprDesc* Expr)
     }
 
     /* The result is always an expression, no reference */
-    ED_MakeRValExpr (Expr);
+    ED_FinalizeRValLoad (Expr);
 }
 
 
@@ -1730,8 +1868,8 @@ static void UnaryOp (ExprDesc* Expr)
         /* Value is not constant */
         LoadExpr (CF_NONE, Expr);
 
-        /* Get the type of the expression */
-        Flags = TypeOf (Expr->Type);
+        /* Adjust the type of the value */
+        Flags = g_typeadjust (TypeOf (Expr->Type), TypeOf (type_int) | CF_CONST);
 
         /* Handle the operation */
         switch (Tok) {
@@ -1741,9 +1879,12 @@ static void UnaryOp (ExprDesc* Expr)
             default:        Internal ("Unexpected token: %d", Tok);
         }
 
-        /* The result is a rvalue in the primary */
-        ED_MakeRValExpr (Expr);
+        /* The result is an rvalue in the primary */
+        ED_FinalizeRValLoad (Expr);
     }
+
+    /* Adjust the type of the expression */
+    Expr->Type = IntPromotion (Expr->Type);
 }
 
 
@@ -1771,26 +1912,28 @@ void hie10 (ExprDesc* Expr)
 
         case TOK_BOOL_NOT:
             NextToken ();
-            if (evalexpr (CF_NONE, hie10, Expr) == 0) {
+            BoolExpr (hie10, Expr);
+            if (ED_IsConstAbs (Expr)) {
                 /* Constant expression */
                 Expr->IVal = !Expr->IVal;
+            } else if (ED_IsAddrExpr (Expr)) {
+                /* Address != NULL, so !Address == 0 */
+                ED_MakeConstBool (Expr, 0);
             } else {
+                /* Not constant, load into the primary */
+                LoadExpr (CF_NONE, Expr);
                 g_bneg (TypeOf (Expr->Type));
-                ED_MakeRValExpr (Expr);
+                ED_FinalizeRValLoad (Expr);
                 ED_TestDone (Expr);             /* bneg will set cc */
             }
+            /* The result type is always boolean */
+            Expr->Type = type_bool;
             break;
 
         case TOK_STAR:
             NextToken ();
             ExprWithCheck (hie10, Expr);
-            if (ED_IsLVal (Expr) || !(ED_IsLocConst (Expr) || ED_IsLocStack (Expr))) {
-                /* Not a const, load it into the primary and make it a
-                ** calculated value.
-                */
-                LoadExpr (CF_NONE, Expr);
-                ED_MakeRValExpr (Expr);
-            }
+
             /* If the expression is already a pointer to function, the
             ** additional dereferencing operator must be ignored. A function
             ** itself is represented as "pointer to function", so any number
@@ -1799,8 +1942,16 @@ void hie10 (ExprDesc* Expr)
             */
             if (IsTypeFuncPtr (Expr->Type) || IsTypeFunc (Expr->Type)) {
                 /* Expression not storable */
-                ED_MakeRVal (Expr);
+                ED_MarkExprAsRVal (Expr);
             } else {
+                if (!ED_IsQuasiConstAddr (Expr)) {
+                    /* Not a constant address, load the pointer into the primary
+                    ** and make it a calculated value.
+                    */
+                    LoadExpr (CF_NONE, Expr);
+                    ED_FinalizeRValLoad (Expr);
+                }
+
                 if (IsClassPtr (Expr->Type)) {
                     Expr->Type = Indirect (Expr->Type);
                 } else {
@@ -1810,8 +1961,8 @@ void hie10 (ExprDesc* Expr)
                 ** address -- it already is the location of the first element.
                 */
                 if (!IsTypeArray (Expr->Type)) {
-                    /* The * operator yields an lvalue */
-                    ED_MakeLVal (Expr);
+                    /* The * operator yields an lvalue reference */
+                    ED_IndExpr (Expr);
                 }
             }
             break;
@@ -1820,20 +1971,23 @@ void hie10 (ExprDesc* Expr)
             NextToken ();
             ExprWithCheck (hie10, Expr);
             /* The & operator may be applied to any lvalue, and it may be
-            ** applied to functions, even if they're no lvalues.
+            ** applied to functions and arrays, even if they're not lvalues.
             */
-            if (ED_IsRVal (Expr) && !IsTypeFunc (Expr->Type) && !IsTypeArray (Expr->Type)) {
-                Error ("Illegal address");
-            } else {
+            if (!IsTypeFunc (Expr->Type) && !IsTypeArray (Expr->Type)) {
+                if (ED_IsRVal (Expr)) {
+                    Error ("Illegal address");
+                    break;
+                }
+
                 if (ED_IsBitField (Expr)) {
                     Error ("Cannot take address of bit-field");
                     /* Do it anyway, just to avoid further warnings */
-                    Expr->Flags &= ~E_BITFIELD;
+                    ED_DisBitField (Expr);
                 }
-                Expr->Type = PointerTo (Expr->Type);
-                /* The & operator yields an rvalue */
-                ED_MakeRVal (Expr);
+                /* The & operator yields an rvalue address */
+                ED_AddrExpr (Expr);
             }
+            Expr->Type = PointerTo (Expr->Type);
             break;
 
         case TOK_SIZEOF:
@@ -1841,21 +1995,25 @@ void hie10 (ExprDesc* Expr)
             if (TypeSpecAhead ()) {
                 Type T[MAXTYPELEN];
                 NextToken ();
-                Size = CheckedSizeOf (ParseType (T));
+                Size = ExprCheckedSizeOf (ParseType (T));
                 ConsumeRParen ();
             } else {
                 /* Remember the output queue pointer */
                 CodeMark Mark;
                 GetCodePos (&Mark);
-                hie10 (Expr);
-                /* If the expression is a literal string, release it, so it
-                ** won't be output as data if not used elsewhere.
-                */
-                if (ED_IsLocLiteral (Expr)) {
-                    ReleaseLiteral (Expr->LVal);
+
+                /* The expression shall be unevaluated */
+                ExprDesc Uneval;
+                ED_Init (&Uneval);
+                ED_MarkForUneval (&Uneval);
+                hie10 (&Uneval);
+                if (ED_IsBitField (&Uneval)) {
+                    Error ("Cannot apply 'sizeof' to bit-field");
+                    Size = 0;
+                } else {
+                    /* Calculate the size */
+                    Size = ExprCheckedSizeOf (Uneval.Type);
                 }
-                /* Calculate the size */
-                Size = CheckedSizeOf (Expr->Type);
                 /* Remove any generated code */
                 RemoveCode (&Mark);
             }
@@ -1894,7 +2052,6 @@ static void hie_internal (const GenDesc* Ops,   /* List of generators */
                           int* UsedGen)
 /* Helper function */
 {
-    ExprDesc Expr2;
     CodeMark Mark1;
     CodeMark Mark2;
     const GenDesc* Gen;
@@ -1908,6 +2065,10 @@ static void hie_internal (const GenDesc* Ops,   /* List of generators */
 
     *UsedGen = 0;
     while ((Gen = FindGen (CurTok.Tok, Ops)) != 0) {
+
+        ExprDesc Expr2;
+        ED_Init (&Expr2);
+        Expr2.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
         /* Tell the caller that we handled it's ops */
         *UsedGen = 1;
@@ -1965,7 +2126,7 @@ static void hie_internal (const GenDesc* Ops,   /* List of generators */
             RemoveCode (&Mark1);
 
             /* Get the type of the result */
-            Expr->Type = promoteint (Expr->Type, Expr2.Type);
+            Expr->Type = ArithmeticConvert (Expr->Type, Expr2.Type);
 
             /* Handle the op differently for signed and unsigned types */
             if (IsSignSigned (Expr->Type)) {
@@ -2057,18 +2218,18 @@ static void hie_internal (const GenDesc* Ops,   /* List of generators */
             if ((Gen->Flags & GEN_NOPUSH) == 0) {
                 g_push (ltype, 0);
             } else {
-                ltype |= CF_REG;        /* Value is in register */
+                ltype |= CF_PRIMARY;        /* Value is in register */
             }
 
             /* Determine the type of the operation result. */
             type |= g_typeadjust (ltype, rtype);
-            Expr->Type = promoteint (Expr->Type, Expr2.Type);
+            Expr->Type = ArithmeticConvert (Expr->Type, Expr2.Type);
 
             /* Generate code */
             Gen->Func (type, Expr->IVal);
 
-            /* We have a rvalue in the primary now */
-            ED_MakeRValExpr (Expr);
+            /* We have an rvalue in the primary now */
+            ED_FinalizeRValLoad (Expr);
 
         } else {
 
@@ -2089,19 +2250,19 @@ static void hie_internal (const GenDesc* Ops,   /* List of generators */
                 }
                 if ((Gen->Flags & GEN_NOPUSH) != 0) {
                     RemoveCode (&Mark2);
-                    ltype |= CF_REG;    /* Value is in register */
+                    ltype |= CF_PRIMARY;    /* Value is in register */
                 }
             }
 
             /* Determine the type of the operation result. */
             type |= g_typeadjust (ltype, rtype);
-            Expr->Type = promoteint (Expr->Type, Expr2.Type);
+            Expr->Type = ArithmeticConvert (Expr->Type, Expr2.Type);
 
             /* Generate code */
             Gen->Func (type, Expr2.IVal);
 
-            /* We have a rvalue in the primary now */
-            ED_MakeRValExpr (Expr);
+            /* We have an rvalue in the primary now */
+            ED_FinalizeRValLoad (Expr);
         }
     }
 }
@@ -2113,7 +2274,6 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
                          void (*hienext) (ExprDesc*))
 /* Helper function for the compare operators */
 {
-    ExprDesc Expr2;
     CodeMark Mark0;
     CodeMark Mark1;
     CodeMark Mark2;
@@ -2127,6 +2287,10 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
     ExprWithCheck (hienext, Expr);
 
     while ((Gen = FindGen (CurTok.Tok, Ops)) != 0) {
+
+        ExprDesc Expr2;
+        ED_Init (&Expr2);
+        Expr2.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
         /* Remember the generator function */
         void (*GenFunc) (unsigned, unsigned long) = Gen->Func;
@@ -2169,16 +2333,21 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
             LoadExpr (CF_NONE, &Expr2);
         }
 
+        /* Check if operands have allowed types for this operation */
+        if (!IsRelationType (Expr->Type) || !IsRelationType (Expr2.Type)) {
+            /* Output only one message even if both sides are wrong */
+            TypeCompatibilityDiagnostic (Expr->Type, Expr2.Type, 1,
+                "Comparing types '%s' with '%s' is invalid");
+            /* Avoid further errors */
+            ED_MakeConstAbsInt (Expr, 0);
+            ED_MakeConstAbsInt (&Expr2, 0);
+        }
+
         /* Some operations aren't allowed on function pointers */
         if ((Gen->Flags & GEN_NOFUNC) != 0) {
-            /* Output only one message even if both sides are wrong */
-            if (IsTypeFuncPtr (Expr->Type)) {
-                Error ("Invalid left operand for relational operator");
-                /* Avoid further errors */
-                ED_MakeConstAbsInt (Expr, 0);
-                ED_MakeConstAbsInt (&Expr2, 0);
-            } else if (IsTypeFuncPtr (Expr2.Type)) {
-                Error ("Invalid right operand for relational operator");
+            if ((IsTypeFuncPtr (Expr->Type) || IsTypeFuncPtr (Expr2.Type))) {
+                /* Output only one message even if both sides are wrong */
+                Error ("Cannot use function pointers in this relation operation");
                 /* Avoid further errors */
                 ED_MakeConstAbsInt (Expr, 0);
                 ED_MakeConstAbsInt (&Expr2, 0);
@@ -2187,8 +2356,14 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
 
         /* Make sure, the types are compatible */
         if (IsClassInt (Expr->Type)) {
-            if (!IsClassInt (Expr2.Type) && !(IsClassPtr(Expr2.Type) && ED_IsNullPtr(Expr))) {
-                Error ("Incompatible types");
+            if (!IsClassInt (Expr2.Type) && !ED_IsNullPtr (Expr)) {
+                if (IsClassPtr (Expr2.Type)) {
+                    TypeCompatibilityDiagnostic (Expr->Type, PtrConversion (Expr2.Type), 0,
+                        "Comparing integer '%s' with pointer '%s'");
+                } else {
+                    TypeCompatibilityDiagnostic (Expr->Type, Expr2.Type, 1,
+                        "Comparing types '%s' with '%s' is invalid");
+                }
             }
         } else if (IsClassPtr (Expr->Type)) {
             if (IsClassPtr (Expr2.Type)) {
@@ -2199,20 +2374,22 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
                 Type* right = Indirect (Expr2.Type);
                 if (TypeCmp (left, right) < TC_QUAL_DIFF && left->C != T_VOID && right->C != T_VOID) {
                     /* Incompatible pointers */
-                    Error ("Incompatible types");
+                    TypeCompatibilityDiagnostic (PtrConversion (Expr->Type), PtrConversion (Expr2.Type), 0,
+                        "Incompatible pointer types comparing '%s' with '%s'");
                 }
             } else if (!ED_IsNullPtr (&Expr2)) {
-                Error ("Incompatible types");
+                if (IsClassInt (Expr2.Type)) {
+                    TypeCompatibilityDiagnostic (PtrConversion (Expr->Type), Expr2.Type, 0,
+                        "Comparing pointer type '%s' with integer type '%s'");
+                } else {
+                    TypeCompatibilityDiagnostic (Expr->Type, Expr2.Type, 1,
+                        "Comparing types '%s' with '%s' is invalid");
+                }
             }
         }
 
         /* Check for const operands */
         if (ED_IsConstAbs (Expr) && rconst) {
-
-            /* If the result is constant, this is suspicious when not in
-            ** preprocessor mode.
-            */
-            WarnConstCompareResult ();
 
             /* Both operands are constant, remove the generated code */
             RemoveCode (&Mark1);
@@ -2250,6 +2427,38 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
                 }
             }
 
+            /* If the result is constant, this is suspicious when not in
+            ** preprocessor mode.
+            */
+            WarnConstCompareResult (Expr);
+
+        } else if (ED_CodeRangeIsEmpty (&Expr2) &&
+                   ((ED_IsAddrExpr (Expr) && ED_IsNullPtr (&Expr2)) ||
+                    (ED_IsNullPtr (Expr) && (ED_IsAddrExpr (&Expr2))))) {
+
+            /* Object addresses are inequal to null pointer */
+            Expr->IVal = (Tok != TOK_EQ);
+            if (ED_IsNullPtr (&Expr2)) {
+                if (Tok == TOK_LT || Tok == TOK_LE) {
+                    Expr->IVal = 0;
+                }
+            } else {
+                if (Tok == TOK_GT || Tok == TOK_GE) {
+                    Expr->IVal = 0;
+                }
+            }
+
+            /* Get rid of unwanted flags */
+            ED_MakeConstBool (Expr, Expr->IVal);
+
+            /* If the result is constant, this is suspicious when not in
+            ** preprocessor mode.
+            */
+            WarnConstCompareResult (Expr);
+
+            /* Both operands are static, remove the generated code */
+            RemoveCode (&Mark1);
+
         } else {
 
             /* Determine the signedness of the operands */
@@ -2265,7 +2474,7 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
                 flags |= CF_CONST;
                 if ((Gen->Flags & GEN_NOPUSH) != 0) {
                     RemoveCode (&Mark2);
-                    ltype |= CF_REG;    /* Value is in register */
+                    ltype |= CF_PRIMARY;    /* Value is in register */
                 }
             }
 
@@ -2307,48 +2516,48 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
 
                     case TOK_EQ:
                         if (Expr2.IVal < LeftMin || Expr2.IVal > LeftMax) {
-                            ED_MakeConstAbsInt (Expr, 0);
-                            WarnConstCompareResult ();
+                            ED_MakeConstBool (Expr, 0);
+                            WarnConstCompareResult (Expr);
                             goto Done;
                         }
                         break;
 
                     case TOK_NE:
                         if (Expr2.IVal < LeftMin || Expr2.IVal > LeftMax) {
-                            ED_MakeConstAbsInt (Expr, 1);
-                            WarnConstCompareResult ();
+                            ED_MakeConstBool (Expr, 1);
+                            WarnConstCompareResult (Expr);
                             goto Done;
                         }
                         break;
 
                     case TOK_LT:
                         if (Expr2.IVal <= LeftMin || Expr2.IVal > LeftMax) {
-                            ED_MakeConstAbsInt (Expr, Expr2.IVal > LeftMax);
-                            WarnConstCompareResult ();
+                            ED_MakeConstBool (Expr, Expr2.IVal > LeftMax);
+                            WarnConstCompareResult (Expr);
                             goto Done;
                         }
                         break;
 
                     case TOK_LE:
                         if (Expr2.IVal < LeftMin || Expr2.IVal >= LeftMax) {
-                            ED_MakeConstAbsInt (Expr, Expr2.IVal >= LeftMax);
-                            WarnConstCompareResult ();
+                            ED_MakeConstBool (Expr, Expr2.IVal >= LeftMax);
+                            WarnConstCompareResult (Expr);
                             goto Done;
                         }
                         break;
 
                     case TOK_GE:
                         if (Expr2.IVal <= LeftMin || Expr2.IVal > LeftMax) {
-                            ED_MakeConstAbsInt (Expr, Expr2.IVal <= LeftMin);
-                            WarnConstCompareResult ();
+                            ED_MakeConstBool (Expr, Expr2.IVal <= LeftMin);
+                            WarnConstCompareResult (Expr);
                             goto Done;
                         }
                         break;
 
                     case TOK_GT:
                         if (Expr2.IVal < LeftMin || Expr2.IVal >= LeftMax) {
-                            ED_MakeConstAbsInt (Expr, Expr2.IVal < LeftMin);
-                            WarnConstCompareResult ();
+                            ED_MakeConstBool (Expr, Expr2.IVal < LeftMin);
+                            WarnConstCompareResult (Expr);
                             goto Done;
                         }
                         break;
@@ -2441,14 +2650,14 @@ static void hie_compare (const GenDesc* Ops,    /* List of generators */
             GenFunc (flags, Expr2.IVal);
 
             /* The result is an rvalue in the primary */
-            ED_MakeRValExpr (Expr);
+            ED_FinalizeRValLoad (Expr);
+
+            /* Condition codes are set */
+            ED_TestDone (Expr);
         }
 
-        /* Result type is always int */
-        Expr->Type = type_int;
-
-Done:   /* Condition codes are set */
-        ED_TestDone (Expr);
+        /* Result type is always boolean */
+Done:   Expr->Type = type_bool;
     }
 }
 
@@ -2481,6 +2690,9 @@ static void parseadd (ExprDesc* Expr)
     CodeMark Mark;              /* Remember code position */
     Type* lhst;                 /* Type of left hand side */
     Type* rhst;                 /* Type of right hand side */
+
+    ED_Init (&Expr2);
+    Expr2.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
     /* Skip the PLUS token */
     NextToken ();
@@ -2534,12 +2746,12 @@ static void parseadd (ExprDesc* Expr)
             rhst = Expr2.Type;
 
             /* Setup flags */
-            if (ED_IsLocAbs (Expr)) {
+            if (ED_IsLocNone (Expr)) {
                 /* A numerical constant */
                 flags |= CF_CONST;
             } else {
                 /* Constant address label */
-                flags |= GlobalModeFlags (Expr) | CF_CONSTADDR;
+                flags |= GlobalModeFlags (Expr);
             }
 
             /* Check for pointer arithmetic */
@@ -2549,7 +2761,7 @@ static void parseadd (ExprDesc* Expr)
                 /* Operate on pointers, result type is a pointer */
                 flags |= CF_PTR;
                 /* Generate the code for the add */
-                if (ED_GetLoc (Expr) == E_LOC_ABS) {
+                if (ED_GetLoc (Expr) == E_LOC_NONE) {
                     /* Numeric constant */
                     g_inc (flags, Expr->IVal);
                 } else {
@@ -2569,7 +2781,7 @@ static void parseadd (ExprDesc* Expr)
                 ** not a numeric constant, and the scale factor is not one
                 ** (no scaling), we must take the long way over the stack.
                 */
-                if (ED_IsLocAbs (Expr)) {
+                if (ED_IsLocNone (Expr)) {
                     /* Numeric constant, scale lhs */
                     Expr->IVal *= ScaleFactor;
                     /* Generate the code for the add */
@@ -2588,7 +2800,7 @@ static void parseadd (ExprDesc* Expr)
                 /* Integer addition */
                 flags |= typeadjust (Expr, &Expr2, 1);
                 /* Generate the code for the add */
-                if (ED_IsLocAbs (Expr)) {
+                if (ED_IsLocNone (Expr)) {
                     /* Numeric constant */
                     g_inc (flags, Expr->IVal);
                 } else {
@@ -2601,8 +2813,8 @@ static void parseadd (ExprDesc* Expr)
                 flags = CF_INT;
             }
 
-            /* Result is a rvalue in primary register */
-            ED_MakeRValExpr (Expr);
+            /* Result is an rvalue in primary register */
+            ED_FinalizeRValLoad (Expr);
         }
 
     } else {
@@ -2692,8 +2904,8 @@ static void parseadd (ExprDesc* Expr)
 
         }
 
-        /* Result is a rvalue in primary register */
-        ED_MakeRValExpr (Expr);
+        /* Result is an rvalue in primary register */
+        ED_FinalizeRValLoad (Expr);
     }
 
     /* Condition codes not set */
@@ -2716,6 +2928,8 @@ static void parsesub (ExprDesc* Expr)
     CodeMark Mark2;             /* Another position in the queue */
     int rscale;                 /* Scale factor for the result */
 
+    ED_Init (&Expr2);
+    Expr2.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
     /* lhs cannot be function or pointer to function */
     if (IsTypeFunc (Expr->Type) || IsTypeFuncPtr (Expr->Type)) {
@@ -2825,8 +3039,8 @@ static void parsesub (ExprDesc* Expr)
                 g_scale (flags, -rscale);
             }
 
-            /* Result is a rvalue in the primary register */
-            ED_MakeRValExpr (Expr);
+            /* Result is an rvalue in the primary register */
+            ED_FinalizeRValLoad (Expr);
             ED_MarkAsUntested (Expr);
 
         }
@@ -2860,8 +3074,8 @@ static void parsesub (ExprDesc* Expr)
             ** the lhs is const, we have to remove this mark, since this is no
             ** longer true, lhs is on stack instead.
             */
-            if (ED_IsLocAbs (Expr)) {
-                ED_MakeRValExpr (Expr);
+            if (ED_IsLocNone (Expr)) {
+                ED_FinalizeRValLoad (Expr);
             }
             /* Adjust operand types */
             flags = typeadjust (Expr, &Expr2, 0);
@@ -2879,8 +3093,8 @@ static void parsesub (ExprDesc* Expr)
             g_scale (flags, -rscale);
         }
 
-        /* Result is a rvalue in the primary register */
-        ED_MakeRValExpr (Expr);
+        /* Result is an rvalue in the primary register */
+        ED_FinalizeRValLoad (Expr);
         ED_MarkAsUntested (Expr);
     }
 }
@@ -2977,16 +3191,14 @@ static void hieAndPP (ExprDesc* Expr)
 ** called recursively from the preprocessor.
 */
 {
-    ExprDesc Expr2;
-
-    ConstAbsIntExpr (hie2, Expr);
+    *Expr = NoCodeConstAbsIntExpr (hie2);
     while (CurTok.Tok == TOK_BOOL_AND) {
 
         /* Skip the && */
         NextToken ();
 
         /* Get rhs */
-        ConstAbsIntExpr (hie2, &Expr2);
+        ExprDesc Expr2 = NoCodeConstAbsIntExpr (hie2);
 
         /* Combine the two */
         Expr->IVal = (Expr->IVal && Expr2.IVal);
@@ -3000,16 +3212,14 @@ static void hieOrPP (ExprDesc *Expr)
 ** called recursively from the preprocessor.
 */
 {
-    ExprDesc Expr2;
-
-    ConstAbsIntExpr (hieAndPP, Expr);
+    *Expr = NoCodeConstAbsIntExpr (hieAndPP);
     while (CurTok.Tok == TOK_BOOL_OR) {
 
         /* Skip the && */
         NextToken ();
 
         /* Get rhs */
-        ConstAbsIntExpr (hieAndPP, &Expr2);
+        ExprDesc Expr2 = NoCodeConstAbsIntExpr (hieAndPP);
 
         /* Combine the two */
         Expr->IVal = (Expr->IVal || Expr2.IVal);
@@ -3018,61 +3228,137 @@ static void hieOrPP (ExprDesc *Expr)
 
 
 
-static void hieAnd (ExprDesc* Expr, unsigned TrueLab, int* BoolOp)
-/* Process "exp && exp" */
+static int hieAnd (ExprDesc* Expr, unsigned* TrueLab, int* TrueLabAllocated)
+/* Process "exp && exp". This should only be called within hieOr.
+** Return true if logic AND does occur.
+*/
 {
-    int FalseLab;
-    ExprDesc Expr2;
+    unsigned Flags = Expr->Flags & E_MASK_KEEP_SUBEXPR;
+    int HasFalseJump = 0, HasTrueJump = 0;
+    CodeMark Start;
 
+    /* Get a label that we will use for false expressions */
+    int FalseLab = GetLocalLabel ();
+
+    /* Get lhs */
+    GetCodePos (&Start);
     ExprWithCheck (hie2, Expr);
+    if ((Flags & E_EVAL_UNEVAL) == E_EVAL_UNEVAL) {
+        RemoveCode (&Start);
+    }
+
     if (CurTok.Tok == TOK_BOOL_AND) {
 
-        /* Tell our caller that we're evaluating a boolean */
-        *BoolOp = 1;
+        ExprDesc Expr2;
 
-        /* Get a label that we will use for false expressions */
-        FalseLab = GetLocalLabel ();
+        /* Check type */
+        if (!ED_IsBool (Expr)) {
+            Error ("Scalar expression expected");
+            ED_MakeConstBool (Expr, 0);
+        } else if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+            if (!ED_IsConstBool (Expr)) {
+                /* Set the test flag */
+                ED_RequireTest (Expr);
 
-        /* If the expr hasn't set condition codes, set the force-test flag */
-        if (!ED_IsTested (Expr)) {
-            ED_MarkForTest (Expr);
+                /* Load the value */
+                LoadExpr (CF_FORCECHAR, Expr);
+
+                /* Clear the test flag */
+                ED_RequireNoTest (Expr);
+
+                /* Remember that the jump is used */
+                HasFalseJump = 1;
+
+                /* Generate the jump */
+                g_falsejump (CF_NONE, FalseLab);
+            } else if (Expr->IVal == 0 && !ED_IsAddrExpr (Expr)) {
+                /* Skip remaining */
+                Flags |= E_EVAL_UNEVAL;
+            }
         }
-
-        /* Load the value */
-        LoadExpr (CF_FORCECHAR, Expr);
-
-        /* Generate the jump */
-        g_falsejump (CF_NONE, FalseLab);
 
         /* Parse more boolean and's */
         while (CurTok.Tok == TOK_BOOL_AND) {
+
+            ED_Init (&Expr2);
+            Expr2.Flags = Flags;
 
             /* Skip the && */
             NextToken ();
 
             /* Get rhs */
+            GetCodePos (&Start);
             hie2 (&Expr2);
-            if (!ED_IsTested (&Expr2)) {
-                ED_MarkForTest (&Expr2);
+            if ((Flags & E_EVAL_UNEVAL) == E_EVAL_UNEVAL) {
+                RemoveCode (&Start);
             }
-            LoadExpr (CF_FORCECHAR, &Expr2);
 
-            /* Do short circuit evaluation */
-            if (CurTok.Tok == TOK_BOOL_AND) {
-                g_falsejump (CF_NONE, FalseLab);
-            } else {
-                /* Last expression - will evaluate to true */
-                g_truejump (CF_NONE, TrueLab);
+            /* Check type */
+            if (!ED_IsBool (&Expr2)) {
+                Error ("Scalar expression expected");
+                ED_MakeConstBool (&Expr2, 0);
+            } else if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+                if (!ED_IsConstBool (&Expr2)) {
+                    ED_RequireTest (&Expr2);
+                    LoadExpr (CF_FORCECHAR, &Expr2);
+
+                    /* Do short circuit evaluation */
+                    if (CurTok.Tok == TOK_BOOL_AND) {
+                        HasFalseJump = 1;
+                        g_falsejump (CF_NONE, FalseLab);
+                    } else {
+                        /* We need the true label for the last expression */
+                        HasTrueJump = 1;
+                    }
+                } else if (Expr2.IVal == 0 && !ED_IsAddrExpr (&Expr2)) {
+                    /* Skip remaining */
+                    Flags |= E_EVAL_UNEVAL;
+                    /* The value of the expression will be false */
+                    ED_MakeConstBool (Expr, 0);
+                }
             }
         }
 
-        /* Define the false jump label here */
-        g_defcodelabel (FalseLab);
+        /* Last expression */
+        if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+            if (HasFalseJump || HasTrueJump) {
+                if (*TrueLabAllocated == 0) {
+                    /* Get a label that we will use for true expressions */
+                    *TrueLab = GetLocalLabel ();
+                    *TrueLabAllocated = 1;
+                }
+                if (!ED_IsConstAbs (&Expr2)) {
+                    /* Will branch to true and fall to false */
+                    g_truejump (CF_NONE, *TrueLab);
+                } else {
+                    /* Will jump away */
+                    g_jump (*TrueLab);
+                }
+                /* The result is an rvalue in primary */
+                ED_FinalizeRValLoad (Expr);
+                /* No need to test as the result will be jumped to */
+                ED_TestDone (Expr);
+            }
+        }
 
-        /* The result is an rvalue in primary */
-        ED_MakeRValExpr (Expr);
-        ED_TestDone (Expr);     /* Condition codes are set */
+        if (HasFalseJump) {
+            /* Define the false jump label here */
+            g_defcodelabel (FalseLab);
+        }
+
+        /* Convert to bool */
+        if ((ED_IsConstAbs (Expr) && Expr->IVal != 0) ||
+            ED_IsAddrExpr (Expr)) {
+            ED_MakeConstBool (Expr, 1);
+        } else {
+            Expr->Type = type_bool;
+        }
+
+        /* Tell our caller that we're evaluating a boolean */
+        return 1;
     }
+
+    return 0;
 }
 
 
@@ -3080,71 +3366,131 @@ static void hieAnd (ExprDesc* Expr, unsigned TrueLab, int* BoolOp)
 static void hieOr (ExprDesc *Expr)
 /* Process "exp || exp". */
 {
-    ExprDesc Expr2;
-    int BoolOp = 0;             /* Did we have a boolean op? */
-    int AndOp;                  /* Did we have a && operation? */
+    unsigned Flags = Expr->Flags & E_MASK_KEEP_SUBEXPR;
+    int      AndOp;             /* Did we have a && operation? */
     unsigned TrueLab;           /* Jump to this label if true */
     unsigned DoneLab;
-
-    /* Get a label */
-    TrueLab = GetLocalLabel ();
+    int      HasTrueJump = 0;
+    CodeMark Start;
 
     /* Call the next level parser */
-    hieAnd (Expr, TrueLab, &BoolOp);
+    GetCodePos (&Start);
+    AndOp = hieAnd (Expr, &TrueLab, &HasTrueJump);
+    if ((Flags & E_EVAL_UNEVAL) == E_EVAL_UNEVAL) {
+        RemoveCode (&Start);
+    }
 
     /* Any boolean or's? */
     if (CurTok.Tok == TOK_BOOL_OR) {
 
-        /* If the expr hasn't set condition codes, set the force-test flag */
-        if (!ED_IsTested (Expr)) {
-            ED_MarkForTest (Expr);
+        /* Check type */
+        if (!ED_IsBool (Expr)) {
+            Error ("Scalar expression expected");
+            ED_MakeConstBool (Expr, 0);
+        } else if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+ 
+            if (!ED_IsConstBool (Expr)) {
+                /* Test the lhs if we haven't had && operators. If we had them, the
+                ** jump is already in place and there's no need to do the test.
+                */
+                if (!AndOp) {
+                    /* Set the test flag */
+                    ED_RequireTest (Expr);
+
+                    /* Get first expr */
+                    LoadExpr (CF_FORCECHAR, Expr);
+
+                    /* Clear the test flag */
+                    ED_RequireNoTest (Expr);
+
+                    if (HasTrueJump == 0) {
+                        /* Get a label that we will use for true expressions */
+                        TrueLab = GetLocalLabel();
+                        HasTrueJump = 1;
+                    }
+
+                    /* Jump to TrueLab if true */
+                    g_truejump (CF_NONE, TrueLab);
+                }
+            } else if (Expr->IVal != 0 || ED_IsAddrExpr (Expr)) {
+                /* Skip remaining */
+                Flags |= E_EVAL_UNEVAL;
+            }
         }
-
-        /* Get first expr */
-        LoadExpr (CF_FORCECHAR, Expr);
-
-        /* For each expression jump to TrueLab if true. Beware: If we
-        ** had && operators, the jump is already in place!
-        */
-        if (!BoolOp) {
-            g_truejump (CF_NONE, TrueLab);
-        }
-
-        /* Remember that we had a boolean op */
-        BoolOp = 1;
 
         /* while there's more expr */
         while (CurTok.Tok == TOK_BOOL_OR) {
 
+            ExprDesc Expr2;
+            ED_Init (&Expr2);
+            Expr2.Flags = Flags;
+
             /* skip the || */
             NextToken ();
 
-            /* Get a subexpr */
-            AndOp = 0;
-            hieAnd (&Expr2, TrueLab, &AndOp);
-            if (!ED_IsTested (&Expr2)) {
-                ED_MarkForTest (&Expr2);
+            /* Get rhs subexpression */
+            GetCodePos (&Start);
+            AndOp = hieAnd (&Expr2, &TrueLab, &HasTrueJump);
+            if ((Flags & E_EVAL_UNEVAL) == E_EVAL_UNEVAL) {
+                RemoveCode (&Start);
             }
-            LoadExpr (CF_FORCECHAR, &Expr2);
 
-            /* If there is more to come, add shortcut boolean eval. */
-            g_truejump (CF_NONE, TrueLab);
+            /* Check type */
+            if (!ED_IsBool (&Expr2)) {
+                Error ("Scalar expression expected");
+                ED_MakeConstBool (&Expr2, 0);
+            } else if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+
+                if (!ED_IsConstBool (&Expr2)) {
+                    /* If there is more to come, add shortcut boolean eval */
+                    if (!AndOp) {
+                        ED_RequireTest (&Expr2);
+                        LoadExpr (CF_FORCECHAR, &Expr2);
+
+                        if (HasTrueJump == 0) {
+                            TrueLab = GetLocalLabel();
+                            HasTrueJump = 1;
+                        }
+                        g_truejump (CF_NONE, TrueLab);
+                    }
+                } else if (Expr2.IVal != 0 || ED_IsAddrExpr (&Expr2)) {
+                    /* Skip remaining */
+                    Flags |= E_EVAL_UNEVAL;
+                    /* The result is always true */
+                    ED_MakeConstBool (Expr, 1);
+                }
+            }
 
         }
 
-        /* The result is an rvalue in primary */
-        ED_MakeRValExpr (Expr);
-        ED_TestDone (Expr);                     /* Condition codes are set */
+        /* Convert to bool */
+        if ((ED_IsConstAbs (Expr) && Expr->IVal != 0) ||
+            ED_IsAddrExpr (Expr)) {
+            ED_MakeConstBool (Expr, 1);
+        } else {
+            Expr->Type = type_bool;
+        }
     }
 
-    /* If we really had boolean ops, generate the end sequence */
-    if (BoolOp) {
+    /* If we really had boolean ops, generate the end sequence if necessary */
+    if (HasTrueJump) {
+        /* False case needs to jump over true case */
         DoneLab = GetLocalLabel ();
-        g_getimmed (CF_INT | CF_CONST, 0, 0);   /* Load FALSE */
-        g_falsejump (CF_NONE, DoneLab);
+        if ((Flags & E_EVAL_UNEVAL) != E_EVAL_UNEVAL) {
+            /* Load false only if the result is not true */
+            g_getimmed (CF_INT | CF_CONST, 0, 0);   /* Load FALSE */
+            g_falsejump (CF_NONE, DoneLab);
+        }
+
+        /* Load the true value */
         g_defcodelabel (TrueLab);
         g_getimmed (CF_INT | CF_CONST, 1, 0);   /* Load TRUE */
         g_defcodelabel (DoneLab);
+
+        /* The result is an rvalue in primary */
+        ED_FinalizeRValLoad (Expr);
+        /* Condition codes are set */
+        ED_TestDone (Expr);
     }
 }
 
@@ -3155,13 +3501,13 @@ static void hieQuest (ExprDesc* Expr)
 {
     int         FalseLab;
     int         TrueLab;
+    CodeMark    SkippedBranch;
     CodeMark    TrueCodeEnd;
     ExprDesc    Expr2;          /* Expression 2 */
     ExprDesc    Expr3;          /* Expression 3 */
     int         Expr2IsNULL;    /* Expression 2 is a NULL pointer */
     int         Expr3IsNULL;    /* Expression 3 is a NULL pointer */
     Type*       ResultType;     /* Type of result */
-
 
     /* Call the lower level eval routine */
     if (Preprocessing) {
@@ -3172,14 +3518,32 @@ static void hieQuest (ExprDesc* Expr)
 
     /* Check if it's a ternary expression */
     if (CurTok.Tok == TOK_QUEST) {
+
+        int ConstantCond = ED_IsConstBool (Expr);
+        unsigned Flags   = Expr->Flags & E_MASK_KEEP_RESULT;
+
+        ED_Init (&Expr2);
+        Expr2.Flags = Flags;
+        ED_Init (&Expr3);
+        Expr3.Flags = Flags;
+
         NextToken ();
-        if (!ED_IsTested (Expr)) {
-            /* Condition codes not set, request a test */
-            ED_MarkForTest (Expr);
+
+        /* Convert non-integer constant boolean */
+        if (ED_IsAddrExpr (Expr)) {
+            ED_MakeConstBool (Expr, 1);
         }
-        LoadExpr (CF_NONE, Expr);
-        FalseLab = GetLocalLabel ();
-        g_falsejump (CF_NONE, FalseLab);
+
+        if (!ConstantCond) {
+            /* Condition codes not set, request a test */
+            ED_RequireTest (Expr);
+            LoadExpr (CF_NONE, Expr);
+            FalseLab = GetLocalLabel ();
+            g_falsejump (CF_NONE, FalseLab);
+        } else if (Expr->IVal == 0) {
+            /* Remember the current code position */
+            GetCodePos (&SkippedBranch);
+        }
 
         /* Parse second expression. Remember for later if it is a NULL pointer
         ** expression, then load it into the primary.
@@ -3187,22 +3551,37 @@ static void hieQuest (ExprDesc* Expr)
         ExprWithCheck (hie1, &Expr2);
         Expr2IsNULL = ED_IsNullPtr (&Expr2);
         if (!IsTypeVoid (Expr2.Type)) {
-            /* Load it into the primary */
-            LoadExpr (CF_NONE, &Expr2);
-            ED_MakeRValExpr (&Expr2);
+            if (!ConstantCond || !ED_IsConst (&Expr2)) {
+                /* Load it into the primary */
+                LoadExpr (CF_NONE, &Expr2);
+                ED_FinalizeRValLoad (&Expr2);
+            }
             Expr2.Type = PtrConversion (Expr2.Type);
         }
 
-        /* Remember the current code position */
-        GetCodePos (&TrueCodeEnd);
+        if (!ConstantCond) {
+            /* Remember the current code position */
+            GetCodePos (&TrueCodeEnd);
 
-        /* Jump around the evaluation of the third expression */
-        TrueLab = GetLocalLabel ();
-        ConsumeColon ();
-        g_jump (TrueLab);
+            /* Jump around the evaluation of the third expression */
+            TrueLab = GetLocalLabel ();
 
-        /* Jump here if the first expression was false */
-        g_defcodelabel (FalseLab);
+            ConsumeColon ();
+
+            g_jump (TrueLab);
+
+            /* Jump here if the first expression was false */
+            g_defcodelabel (FalseLab);
+        } else {
+            if (Expr->IVal == 0) {
+                /* Remove the load code of Expr2 */
+                RemoveCode (&SkippedBranch);
+            } else {
+                /* Remember the current code position */
+                GetCodePos (&SkippedBranch);
+            }
+            ConsumeColon();
+        }
 
         /* Parse third expression. Remember for later if it is a NULL pointer
         ** expression, then load it into the primary.
@@ -3210,10 +3589,17 @@ static void hieQuest (ExprDesc* Expr)
         ExprWithCheck (hie1, &Expr3);
         Expr3IsNULL = ED_IsNullPtr (&Expr3);
         if (!IsTypeVoid (Expr3.Type)) {
-            /* Load it into the primary */
-            LoadExpr (CF_NONE, &Expr3);
-            ED_MakeRValExpr (&Expr3);
+            if (!ConstantCond || !ED_IsConst (&Expr3)) {
+                /* Load it into the primary */
+                LoadExpr (CF_NONE, &Expr3);
+                ED_FinalizeRValLoad (&Expr3);
+            }
             Expr3.Type = PtrConversion (Expr3.Type);
+        }
+
+        if (ConstantCond && Expr->IVal != 0) {
+            /* Remove the load code of Expr3 */
+            RemoveCode (&SkippedBranch);
         }
 
         /* Check if any conversions are needed, if so, do them.
@@ -3236,7 +3622,7 @@ static void hieQuest (ExprDesc* Expr)
 
 
             /* Get common type */
-            ResultType = promoteint (Expr2.Type, Expr3.Type);
+            ResultType = ArithmeticConvert (Expr2.Type, Expr3.Type);
 
             /* Convert the third expression to this type if needed */
             TypeConversion (&Expr3, ResultType);
@@ -3248,9 +3634,11 @@ static void hieQuest (ExprDesc* Expr)
             TypeConversion (&Expr2, ResultType);
             GetCodePos (&CvtCodeEnd);
 
-            /* If we had conversion code, move it to the right place */
-            if (!CodeRangeIsEmpty (&CvtCodeStart, &CvtCodeEnd)) {
-                MoveCode (&CvtCodeStart, &CvtCodeEnd, &TrueCodeEnd);
+            if (!ConstantCond) {
+                /* If we had conversion code, move it to the right place */
+                if (!CodeRangeIsEmpty (&CvtCodeStart, &CvtCodeEnd)) {
+                    MoveCode (&CvtCodeStart, &CvtCodeEnd, &TrueCodeEnd);
+                }
             }
 
         } else if (IsClassPtr (Expr2.Type) && IsClassPtr (Expr3.Type)) {
@@ -3270,15 +3658,33 @@ static void hieQuest (ExprDesc* Expr)
             /* Result type is void */
             ResultType = Expr3.Type;
         } else {
-            Error ("Incompatible types");
-            ResultType = Expr2.Type;            /* Doesn't matter here */
+            if (IsClassStruct (Expr2.Type) && IsClassStruct (Expr3.Type) &&
+                TypeCmp (Expr2.Type, Expr3.Type) == TC_IDENTICAL) {
+                /* Result type is struct/union */
+                ResultType = Expr2.Type;
+            } else {
+                TypeCompatibilityDiagnostic (Expr2.Type, Expr3.Type, 1,
+                    "Incompatible types in ternary '%s' with '%s'");
+                ResultType = Expr2.Type;            /* Doesn't matter here */
+            }
         }
 
-        /* Define the final label */
-        g_defcodelabel (TrueLab);
+        if (!ConstantCond) {
+            /* Define the final label */
+            g_defcodelabel (TrueLab);
+            /* Set up the result expression type */
+            ED_FinalizeRValLoad (Expr);
+            /* Restore the original evaluation flags */
+            Expr->Flags = (Expr->Flags & ~E_MASK_KEEP_RESULT) | Flags;
+        } else {
+            if (Expr->IVal != 0) {
+                *Expr = Expr2;
+            } else {
+                *Expr = Expr3;
+            }
+        }
 
         /* Setup the target expression */
-        ED_MakeRValExpr (Expr);
         Expr->Type  = ResultType;
     }
 }
@@ -3288,13 +3694,12 @@ static void hieQuest (ExprDesc* Expr)
 static void opeq (const GenDesc* Gen, ExprDesc* Expr, const char* Op)
 /* Process "op=" operators. */
 {
-    ExprDesc Expr2;
     unsigned flags;
     CodeMark Mark;
     int MustScale;
 
     /* op= can only be used with lvalues */
-    if (!ED_IsLVal (Expr)) {
+    if (ED_IsRVal (Expr)) {
         Error ("Invalid lvalue in assignment");
         return;
     }
@@ -3306,7 +3711,7 @@ static void opeq (const GenDesc* Gen, ExprDesc* Expr, const char* Op)
 
     /* There must be an integer or pointer on the left side */
     if (!IsClassInt (Expr->Type) && !IsTypePtr (Expr->Type)) {
-        Error ("Invalid left operand type");
+        Error ("Invalid left operand for binary operator '%s'", Op);
         /* Continue. Wrong code will be generated, but the compiler won't
         ** break, so this is the best error recovery.
         */
@@ -3328,6 +3733,10 @@ static void opeq (const GenDesc* Gen, ExprDesc* Expr, const char* Op)
     /* Bring the lhs on stack */
     GetCodePos (&Mark);
     g_push (flags, 0);
+
+    ExprDesc Expr2;
+    ED_Init (&Expr2);
+    Expr2.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
     /* Evaluate the rhs */
     MarkedExprWithCheck (hie1, &Expr2);
@@ -3396,7 +3805,7 @@ static void opeq (const GenDesc* Gen, ExprDesc* Expr, const char* Op)
         Gen->Func (g_typeadjust (flags, TypeOf (Expr2.Type)), 0);
     }
     Store (Expr, 0);
-    ED_MakeRValExpr (Expr);
+    ED_FinalizeRValLoad (Expr);
 }
 
 
@@ -3409,8 +3818,10 @@ static void addsubeq (const GenDesc* Gen, ExprDesc *Expr, const char* Op)
     unsigned rflags;
     int      MustScale;
 
+    ED_Init (&Expr2);
+    Expr2.Flags |= Expr->Flags & E_MASK_KEEP_SUBEXPR;
 
-    /* We're currently only able to handle some adressing modes */
+    /* We're currently only able to handle some addressing modes */
     if (ED_GetLoc (Expr) == E_LOC_EXPR || ED_GetLoc (Expr) == E_LOC_PRIMARY) {
         /* Use generic routine */
         opeq (Gen, Expr, Op);
@@ -3430,7 +3841,7 @@ static void addsubeq (const GenDesc* Gen, ExprDesc *Expr, const char* Op)
 
     /* There must be an integer or pointer on the left side */
     if (!IsClassInt (Expr->Type) && !IsTypePtr (Expr->Type)) {
-        Error ("Invalid left operand type");
+        Error ("Invalid left operand for binary operator '%s'", Op);
         /* Continue. Wrong code will be generated, but the compiler won't
         ** break, so this is the best error recovery.
         */
@@ -3456,62 +3867,46 @@ static void addsubeq (const GenDesc* Gen, ExprDesc *Expr, const char* Op)
         ** break, so this is the best error recovery.
         */
     }
+
+    /* Setup the code generator flags */
+    lflags |= TypeOf (Expr->Type) | GlobalModeFlags (Expr) | CF_FORCECHAR;
+    rflags |= TypeOf (Expr2.Type) | CF_FORCECHAR;
+
     if (ED_IsConstAbs (&Expr2)) {
-        /* The resulting value is a constant. Scale it. */
+        /* The resulting value is a constant */
+        rflags |= CF_CONST;
+        lflags |= CF_CONST;
+
+        /* Scale it */
         if (MustScale) {
             Expr2.IVal *= CheckedSizeOf (Indirect (Expr->Type));
         }
-        rflags |= CF_CONST;
-        lflags |= CF_CONST;
     } else {
         /* Not constant, load into the primary */
         LoadExpr (CF_NONE, &Expr2);
+
+        /* Convert the type of the rhs to that of the lhs */
+        g_typecast (lflags, rflags & ~CF_FORCECHAR);
+
         if (MustScale) {
             /* lhs is a pointer, scale rhs */
             g_scale (TypeOf (Expr2.Type), CheckedSizeOf (Indirect (Expr->Type)));
         }
     }
 
-    /* Setup the code generator flags */
-    lflags |= TypeOf (Expr->Type) | GlobalModeFlags (Expr) | CF_FORCECHAR;
-    rflags |= TypeOf (Expr2.Type) | CF_FORCECHAR;
-
-    /* Convert the type of the lhs to that of the rhs */
-    g_typecast (lflags, rflags);
-
     /* Output apropriate code depending on the location */
     switch (ED_GetLoc (Expr)) {
 
         case E_LOC_ABS:
-            /* Absolute: numeric address or const */
-            if (Gen->Tok == TOK_PLUS_ASSIGN) {
-                g_addeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
-            } else {
-                g_subeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
-            }
-            break;
-
         case E_LOC_GLOBAL:
-            /* Global variable */
-            if (Gen->Tok == TOK_PLUS_ASSIGN) {
-                g_addeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
-            } else {
-                g_subeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
-            }
-            break;
-
         case E_LOC_STATIC:
-        case E_LOC_LITERAL:
-            /* Static variable or literal in the literal pool */
-            if (Gen->Tok == TOK_PLUS_ASSIGN) {
-                g_addeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
-            } else {
-                g_subeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
-            }
-            break;
-
         case E_LOC_REGISTER:
-            /* Register variable */
+        case E_LOC_LITERAL:
+        case E_LOC_CODE:
+            /* Absolute numeric addressed variable, global variable, local
+            ** static variable, register variable, pooled literal or code
+            ** label location.
+            */
             if (Gen->Tok == TOK_PLUS_ASSIGN) {
                 g_addeqstatic (lflags, Expr->Name, Expr->IVal, Expr2.IVal);
             } else {
@@ -3532,8 +3927,8 @@ static void addsubeq (const GenDesc* Gen, ExprDesc *Expr, const char* Op)
             Internal ("Invalid location in Store(): 0x%04X", ED_GetLoc (Expr));
     }
 
-    /* Expression is a rvalue in the primary now */
-    ED_MakeRValExpr (Expr);
+    /* Expression is an rvalue in the primary now */
+    ED_FinalizeRValLoad (Expr);
 }
 
 
@@ -3598,33 +3993,35 @@ void hie1 (ExprDesc* Expr)
 void hie0 (ExprDesc *Expr)
 /* Parse comma operator. */
 {
+    unsigned Flags = Expr->Flags & E_MASK_KEEP_MAKE;
+    unsigned PrevErrorCount = ErrorCount;
+    CodeMark Start, End;
+
+    /* Remember the current code position */
+    GetCodePos (&Start);
+
     hie1 (Expr);
     while (CurTok.Tok == TOK_COMMA) {
+        /* If the expression didn't generate code or isn't cast to type void,
+        ** emit a warning.
+        */
+        GetCodePos (&End);
+        if (!ED_MayHaveNoEffect (Expr)      &&
+            CodeRangeIsEmpty (&Start, &End) &&
+            IS_Get (&WarnNoEffect)          &&
+            PrevErrorCount == ErrorCount) {
+            Warning ("Expression result unused");
+        }
+
+        PrevErrorCount = ErrorCount;
+        /* Remember the current code position */
+        GetCodePos (&Start);
+
+        /* Reset the expression */
+        ED_Init (Expr);
+        Expr->Flags = Flags;
         NextToken ();
         hie1 (Expr);
-    }
-}
-
-
-
-int evalexpr (unsigned Flags, void (*Func) (ExprDesc*), ExprDesc* Expr)
-/* Will evaluate an expression via the given function. If the result is a
-** constant, 0 is returned and the value is put in the Expr struct. If the
-** result is not constant, LoadExpr is called to bring the value into the
-** primary register and 1 is returned.
-*/
-{
-    /* Evaluate */
-    ExprWithCheck (Func, Expr);
-
-    /* Check for a constant expression */
-    if (ED_IsConstAbs (Expr)) {
-        /* Constant expression */
-        return 0;
-    } else {
-        /* Not constant, load into the primary */
-        LoadExpr (Flags, Expr);
-        return 1;
     }
 }
 
@@ -3633,24 +4030,17 @@ int evalexpr (unsigned Flags, void (*Func) (ExprDesc*), ExprDesc* Expr)
 void Expression0 (ExprDesc* Expr)
 /* Evaluate an expression via hie0 and put the result into the primary register */
 {
+    unsigned Flags = Expr->Flags & E_MASK_KEEP_RESULT;
+
+    /* Only check further after the expression is evaluated */
     ExprWithCheck (hie0, Expr);
-    LoadExpr (CF_NONE, Expr);
-}
 
+    if ((Expr->Flags & Flags & E_MASK_EVAL) != (Flags & E_MASK_EVAL)) {
+        Internal ("Expression flags tampered: %08X", Flags);
+    }
 
-
-void ConstExpr (void (*Func) (ExprDesc*), ExprDesc* Expr)
-/* Will evaluate an expression via the given function. If the result is not
-** a constant of some sort, a diagnostic will be printed, and the value is
-** replaced by a constant one to make sure there are no internal errors that
-** result from this input error.
-*/
-{
-    ExprWithCheck (Func, Expr);
-    if (!ED_IsConst (Expr)) {
-        Error ("Constant expression expected");
-        /* To avoid any compiler errors, make the expression a valid const */
-        ED_MakeConstAbsInt (Expr, 1);
+    if (ED_YetToLoad (Expr)) {
+        LoadExpr (CF_NONE, Expr);
     }
 }
 
@@ -3665,25 +4055,56 @@ void BoolExpr (void (*Func) (ExprDesc*), ExprDesc* Expr)
 {
     ExprWithCheck (Func, Expr);
     if (!ED_IsBool (Expr)) {
-        Error ("Boolean expression expected");
+        Error ("Scalar expression expected");
         /* To avoid any compiler errors, make the expression a valid int */
-        ED_MakeConstAbsInt (Expr, 1);
+        ED_MakeConstBool (Expr, 1);
     }
 }
 
 
 
-void ConstAbsIntExpr (void (*Func) (ExprDesc*), ExprDesc* Expr)
-/* Will evaluate an expression via the given function. If the result is not
-** a constant numeric integer value, a diagnostic will be printed, and the
-** value is replaced by a constant one to make sure there are no internal
-** errors that result from this input error.
+ExprDesc NoCodeConstExpr (void (*Func) (ExprDesc*))
+/* Get an expression evaluated via the given function. If the result is not a
+** constant expression without runtime code generated, a diagnostic will be
+** printed, and the value is replaced by a constant one to make sure there are
+** no internal errors that result from this input error.
 */
 {
-    ExprWithCheck (Func, Expr);
-    if (!ED_IsConstAbsInt (Expr)) {
+    ExprDesc Expr;
+    ED_Init (&Expr);
+
+    Expr.Flags |= E_EVAL_C_CONST;
+    MarkedExprWithCheck (Func, &Expr);
+    if (!ED_IsConst (&Expr) || !ED_CodeRangeIsEmpty (&Expr)) {
+        Error ("Constant expression expected");
+        /* To avoid any compiler errors, make the expression a valid const */
+        ED_MakeConstAbsInt (&Expr, 1);
+    }
+
+    /* Return by value */
+    return Expr;
+}
+
+
+
+ExprDesc NoCodeConstAbsIntExpr (void (*Func) (ExprDesc*))
+/* Get an expression evaluated via the given function. If the result is not a
+** constant numeric integer value without runtime code generated, a diagnostic
+** will be printed, and the value is replaced by a constant one to make sure
+** there are no internal errors that result from this input error.
+*/
+{
+    ExprDesc Expr;
+    ED_Init (&Expr);
+
+    Expr.Flags |= E_EVAL_C_CONST;
+    MarkedExprWithCheck (Func, &Expr);
+    if (!ED_IsConstAbsInt (&Expr) || !ED_CodeRangeIsEmpty (&Expr)) {
         Error ("Constant integer expression expected");
         /* To avoid any compiler errors, make the expression a valid const */
-        ED_MakeConstAbsInt (Expr, 1);
+        ED_MakeConstAbsInt (&Expr, 1);
     }
+
+    /* Return by value */
+    return Expr;
 }

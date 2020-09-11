@@ -115,8 +115,21 @@ typedef enum {
     CMP_UGT,
     CMP_UGE,
     CMP_ULT,
-    CMP_ULE
+    CMP_ULE,
+
+    /* End of the enumeration */
+    CMP_END
 } cmp_t;
+
+
+
+/* Defines for the conditions in a compare */
+typedef enum {
+    FNCLS_UNKNOWN = -1, /* Unknown */
+    FNCLS_BUILTIN,      /* Builtin */
+    FNCLS_GLOBAL,       /* Found in global sym table minus the leading underscore */
+    FNCLS_NUMERIC       /* A call to a numeric address */
+} fncls_t;
 
 
 
@@ -126,10 +139,11 @@ typedef enum {
 
 
 
-void GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg);
+fncls_t GetFuncInfo (const char* Name, unsigned short* Use, unsigned short* Chg);
 /* For the given function, lookup register information and store it into
 ** the given variables. If the function is unknown, assume it will use and
 ** load all registers.
+** Return the whatever category the function is in.
 */
 
 const ZPInfo* GetZPInfo (const char* Name);
@@ -174,7 +188,30 @@ cmp_t FindTosCmpCond (const char* Name);
 ** Return the condition code or CMP_INV on failure.
 */
 
+const char* GetBoolTransformer (cmp_t Cond);
+/* Get the bool transformer corresponding to the given compare condition */
 
+cmp_t GetNegatedCond (cmp_t Cond);
+/* Get the logically opposite compare condition */
+
+cmp_t GetRevertedCond (cmp_t Cond);
+/* Get the compare condition in reverted order of operands */
+
+const char* GetCmpSuffix (cmp_t Cond);
+/* Return the compare suffix by the given a compare condition or 0 on failure */
+
+char* GetBoolCmpSuffix (char* Buf, cmp_t Cond);
+/* Search for a boolean transformer subroutine (eg. booleq) by the given compare
+** condition.
+** Return the output buffer filled with the name of the correct subroutine or 0
+** on failure.
+*/
+
+char* GetTosCmpSuffix (char* Buf, cmp_t Cond);
+/* Search for a TOS compare function (eg. tosgtax) by the given compare condition.
+** Return the output buffer filled with the name of the correct function or 0 on
+** failure.
+*/
 
 /* End of codeinfo.h */
 

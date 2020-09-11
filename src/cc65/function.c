@@ -72,7 +72,7 @@ Function* CurrentFunc = 0;
 
 
 
-static Function* NewFunction (struct SymEntry* Sym)
+static Function* NewFunction (struct SymEntry* Sym, FuncDesc* D)
 /* Create a new function activation structure and return it */
 {
     /* Allocate a new structure */
@@ -81,7 +81,7 @@ static Function* NewFunction (struct SymEntry* Sym)
     /* Initialize the fields */
     F->FuncEntry  = Sym;
     F->ReturnType = GetFuncReturn (Sym->Type);
-    F->Desc       = GetFuncDesc (Sym->Type);
+    F->Desc       = D;
     F->Reserved   = 0;
     F->RetLab     = GetLocalLabel ();
     F->TopLevelSP = 0;
@@ -101,6 +101,68 @@ static void FreeFunction (Function* F)
 {
     DoneCollection (&F->LocalsBlockStack);
     xfree (F);
+}
+
+
+
+int F_CheckParamList (FuncDesc* D, int RequireAll)
+/* Check and set the parameter sizes.
+** If RequireAll is true, emit errors on parameters of incomplete types.
+** Return true if all parameters have complete types.
+*/
+{
+    unsigned    I = 0;
+    unsigned    Offs;
+    SymEntry*   Param;
+    unsigned    ParamSize = 0;
+    unsigned    IncompleteCount = 0;
+
+    /* Don't bother to check unnecessarily */
+    if ((D->Flags & FD_INCOMPLETE_PARAM) == 0) {
+        return 1;
+    }
+
+    /* Assign offsets. If the function has a variable parameter list,
+    ** there's one additional byte (the arg size).
+    */
+    Offs  = (D->Flags & FD_VARIADIC) ? 1 : 0;
+    Param = D->LastParam;
+    while (Param) {
+        unsigned Size = SizeOf (Param->Type);
+        if (RequireAll && IsIncompleteESUType (Param->Type)) {
+            if (D->Flags & FD_UNNAMED_PARAMS) {
+                Error ("Parameter %u has incomplete type '%s'",
+                       D->ParamCount - I,
+                       GetFullTypeName (Param->Type));
+            } else {
+                Error ("Parameter '%s' has incomplete type '%s'",
+                       Param->Name,
+                       GetFullTypeName (Param->Type));
+            }
+            ++IncompleteCount;
+        }
+        if (SymIsRegVar (Param)) {
+            Param->V.R.SaveOffs = Offs;
+        } else {
+            Param->V.Offs = Offs;
+        }
+        Offs += Size;
+        ParamSize += Size;
+        Param = Param->PrevSym;
+        ++I;
+    }
+
+    /* If all parameters have complete types, set the total size description,
+    ** clear the FD_INCOMPLETE_PARAM flag and return true.
+    */
+    if (IncompleteCount == 0) {
+        D->ParamSize = ParamSize;
+        D->Flags &= ~FD_INCOMPLETE_PARAM;
+        return 1;
+    }
+
+    /* Otherwise return false */
+    return 0;
 }
 
 
@@ -295,7 +357,7 @@ static void F_RestoreRegVars (Function* F)
     }
 
     /* Get the first symbol from the function symbol table */
-    Sym = F->FuncEntry->V.F.Func->SymTab->SymHead;
+    Sym = F->Desc->SymTab->SymHead;
 
     /* Walk through all symbols checking for register variables */
     while (Sym) {
@@ -375,20 +437,38 @@ static void F_EmitDebugInfo (void)
 
 
 
-void NewFunc (SymEntry* Func)
+void NewFunc (SymEntry* Func, FuncDesc* D)
 /* Parse argument declarations and function body. */
 {
+    int         ParamComplete;  /* If all paramemters have complete types */
     int         C99MainFunc = 0;/* Flag for C99 main function returning int */
     SymEntry*   Param;
+    const Type* RType;          /* Real type used for struct parameters */
+    const Type* ReturnType;     /* Return type */
 
-    /* Get the function descriptor from the function entry */
-    FuncDesc* D = Func->V.F.Func;
+    /* Remember this function descriptor used for definition */
+    GetFuncDesc (Func->Type)->FuncDef = D;
 
     /* Allocate the function activation record for the function */
-    CurrentFunc = NewFunction (Func);
+    CurrentFunc = NewFunction (Func, D);
 
     /* Reenter the lexical level */
     ReenterFunctionLevel (D);
+
+    /* Check return type */
+    ReturnType = F_GetReturnType (CurrentFunc);
+    if (IsIncompleteESUType (ReturnType)) {
+        /* There are already diagnostics on returning arrays or functions */
+        if (!IsTypeArray (ReturnType) && !IsTypeFunc (ReturnType)) {
+            Error ("Function has incomplete return type '%s'",
+                    GetFullTypeName (ReturnType));
+        }
+    }
+
+    /* Check and set the parameter sizes. All parameter must have complete
+    ** types now.
+    */
+    ParamComplete = F_CheckParamList (D, 1);
 
     /* Check if the function header contains unnamed parameters. These are
     ** only allowed in cc65 mode.
@@ -428,7 +508,7 @@ void NewFunc (SymEntry* Func)
         /* If cc65 extensions aren't enabled, don't allow a main function that
         ** doesn't return an int.
         */
-        if (IS_Get (&Standard) != STD_CC65 && CurrentFunc->ReturnType[0].C != T_INT) {
+        if (IS_Get (&Standard) != STD_CC65 && ReturnType[0].C != T_INT) {
             Error ("'main' must always return an int");
         }
 
@@ -451,7 +531,7 @@ void NewFunc (SymEntry* Func)
         /* Determine if this is a main function in a C99 environment that
         ** returns an int.
         */
-        if (IsTypeInt (F_GetReturnType (CurrentFunc)) &&
+        if (IsRawTypeInt (F_GetReturnType (CurrentFunc)) &&
             IS_Get (&Standard) == STD_C99) {
             C99MainFunc = 1;
         }
@@ -471,9 +551,9 @@ void NewFunc (SymEntry* Func)
         unsigned Flags;
 
         /* Generate the push */
-        if (IsTypeFunc (D->LastParam->Type)) {
-            /* Pointer to function */
-            Flags = CF_PTR;
+        /* Handle struct/union specially */
+        if (IsClassStruct (D->LastParam->Type)) {
+            Flags = TypeOf (GetStructReplacementType (D->LastParam->Type)) | CF_FORCECHAR;
         } else {
             Flags = TypeOf (D->LastParam->Type) | CF_FORCECHAR;
         }
@@ -481,7 +561,7 @@ void NewFunc (SymEntry* Func)
     }
 
     /* Generate function entry code if needed */
-    g_enter (TypeOf (Func->Type), F_GetParamSize (CurrentFunc));
+    g_enter (FuncTypeOf (Func->Type), F_GetParamSize (CurrentFunc));
 
     /* If stack checking code is requested, emit a call to the helper routine */
     if (IS_Get (&CheckStack)) {
@@ -491,34 +571,50 @@ void NewFunc (SymEntry* Func)
     /* Setup the stack */
     StackPtr = 0;
 
-    /* Walk through the parameter list and allocate register variable space
-    ** for parameters declared as register. Generate code to swap the contents
-    ** of the register bank with the save area on the stack.
-    */
-    Param = D->SymTab->SymHead;
-    while (Param && (Param->Flags & SC_PARAM) != 0) {
+    /* Emit code to handle the parameters if all of them have complete types */
+    if (ParamComplete) {
+        /* Walk through the parameter list and allocate register variable space
+        ** for parameters declared as register. Generate code to swap the contents
+        ** of the register bank with the save area on the stack.
+        */
+        Param = D->SymTab->SymHead;
+        while (Param && (Param->Flags & SC_PARAM) != 0) {
 
-        /* Check for a register variable */
-        if (SymIsRegVar (Param)) {
+            /* Check if we need copy for struct/union type */
+            RType = Param->Type;
+            if (IsClassStruct (RType)) {
+                RType = GetStructReplacementType (RType);
 
-            /* Allocate space */
-            int Reg = F_AllocRegVar (CurrentFunc, Param->Type);
-
-            /* Could we allocate a register? */
-            if (Reg < 0) {
-                /* No register available: Convert parameter to auto */
-                CvtRegVarToAuto (Param);
-            } else {
-                /* Remember the register offset */
-                Param->V.R.RegOffs = Reg;
-
-                /* Generate swap code */
-                g_swap_regvars (Param->V.R.SaveOffs, Reg, CheckedSizeOf (Param->Type));
+                /* If there is no replacement type, then it is just the address.
+                ** We don't currently support this case.
+                */
+                if (RType == Param->Type) {
+                    Error ("Passing '%s' of this size by value is not supported", GetFullTypeName (Param->Type));
+                }
             }
-        }
 
-        /* Next parameter */
-        Param = Param->NextSym;
+            /* Check for a register variable */
+            if (SymIsRegVar (Param)) {
+
+                /* Allocate space */
+                int Reg = F_AllocRegVar (CurrentFunc, RType);
+
+                /* Could we allocate a register? */
+                if (Reg < 0) {
+                    /* No register available: Convert parameter to auto */
+                    CvtRegVarToAuto (Param);
+                } else {
+                    /* Remember the register offset */
+                    Param->V.R.RegOffs = Reg;
+
+                    /* Generate swap code */
+                    g_swap_regvars (Param->V.R.SaveOffs, Reg, CheckedSizeOf (RType));
+                }
+            }
+
+            /* Next parameter */
+            Param = Param->NextSym;
+        }
     }
 
     /* Need a starting curly brace */
@@ -581,6 +677,11 @@ void NewFunc (SymEntry* Func)
 
     /* Restore the old literal pool, remembering the one for the function */
     Func->V.F.LitPool = PopLiteralPool ();
+
+    /* If --local-strings was given, output the literals now */
+    if (IS_Get (&LocalStrings)) {
+        OutputLocalLiteralPool (Func->V.F.LitPool);
+    }
 
     /* Switch back to the old segments */
     PopSegments ();

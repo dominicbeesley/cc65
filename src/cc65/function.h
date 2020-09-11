@@ -67,6 +67,9 @@ struct Function {
 /* Structure that holds all data needed for function activation */
 typedef struct Function Function;
 
+/* Forward declaration */
+struct FuncDesc;
+
 /* Function activation data for current function (or NULL) */
 extern Function* CurrentFunc;
 
@@ -77,6 +80,12 @@ extern Function* CurrentFunc;
 /*****************************************************************************/
 
 
+
+int F_CheckParamList (FuncDesc* D, int RequireAll);
+/* Check and set the parameter sizes.
+** If RequireAll is true, emit errors on parameters of incomplete types.
+** Return true if all parameters have complete types.
+*/
 
 const char* F_GetFuncName (const Function* F);
 /* Return the name of the current function */
@@ -138,7 +147,7 @@ int F_AllocRegVar (Function* F, const Type* Type);
 ** bank (zero page storage). If there is no register space left, return -1.
 */
 
-void NewFunc (struct SymEntry* Func);
+void NewFunc (struct SymEntry* Func, struct FuncDesc* D);
 /* Parse argument declarations and function body. */
 
 
