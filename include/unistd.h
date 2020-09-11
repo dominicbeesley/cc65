@@ -55,6 +55,11 @@
 typedef unsigned size_t;
 #endif
 
+/* whence values for lseek(2) */
+#define SEEK_CUR        0
+#define SEEK_END        1
+#define SEEK_SET        2
+
 /* We need off_t if sys/types is not included */
 #ifndef _HAVE_off_t
 #define _HAVE_off_t
